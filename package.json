@@ -1,0 +1,20 @@
+{
+  "name": "fuurma-matchmaking",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:check": "wrangler deploy --dry-run",
+    "check": "tsc --noEmit",
+    "format": "biome format --write",
+    "lint": "biome check"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260708.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.100.0"
+  },
+  "packageManager": "pnpm@10.30.2"
+}
