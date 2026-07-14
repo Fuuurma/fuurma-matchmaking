@@ -180,7 +180,7 @@ export class MatchmakingQueues extends DurableObject {
       const match: Match = {
         roomId: opponent.roomId,
         host: {
-          peerId: opponent.roomId,
+          peerId: opponent.peerId,
           displayName: opponent.displayName,
           guestId: opponent.guestId,
         },

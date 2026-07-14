@@ -113,6 +113,12 @@ export class GameRoomDO extends DurableObject {
           this.sendError(ws, "invalid", `reserved type: ${type}`)
           return
         }
+        // Relay only from sockets that have completed hello; ignore frames
+        // from any other unauthenticated socket.
+        if (!ws.deserializeAttachment()) {
+          this.sendError(ws, "invalid", "send hello first")
+          return
+        }
         // Relay any other well-formed message verbatim to the other peer.
         // Each game owns its own protocol on top of the room envelope.
         this.fanOut(ws, parsed)
@@ -226,7 +232,6 @@ export class GameRoomDO extends DurableObject {
     })
 
     let slot: Slot
-    let isReconnect = false
 
     if (existing) {
       if (hasActiveSocket) {
@@ -237,7 +242,6 @@ export class GameRoomDO extends DurableObject {
       existing.disconnectedAt = null
       existing.displayName = displayName
       slot = existing
-      isReconnect = true
     } else {
       if (state.slots.length >= MAX_SLOTS) {
         this.sendError(ws, "unknown", "room full")
@@ -283,7 +287,7 @@ export class GameRoomDO extends DurableObject {
       }),
     )
 
-    if (!isReconnect && opponent) {
+    if (opponent) {
       this.broadcastExcept(ws, {
         type: "peer-joined",
         opponent: { guestId: slot.guestId, displayName: slot.displayName },
