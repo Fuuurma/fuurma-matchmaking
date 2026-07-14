@@ -225,9 +225,8 @@ export class MatchmakingQueues extends DurableObject {
   }
 
   private async handleHealth(game: string): Promise<Response> {
-    const state = await this.loadState()
-    const queue = state.queues[game] ?? []
-    const matches = Object.values(state.matches).filter((m) => m.game === game)
+    const queue = await this.getQueue(game)
+    const matches = Object.values(await this.getMatches()).filter((m) => m.game === game)
     return jsonResponse({
       ok: true,
       game,
