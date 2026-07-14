@@ -121,10 +121,17 @@ export class GameRoomDO extends DurableObject {
 
   override async webSocketClose(
     ws: WebSocket,
-    _code: number,
-    _reason: string,
+    code: number,
+    reason: string,
     wasClean: boolean,
   ): Promise<void> {
+    // Auto-reply to the close frame (safe even with auto-reply enabled).
+    try {
+      ws.close(code, reason)
+    } catch {
+      // already closed
+    }
+
     const att = ws.deserializeAttachment() as ConnectionAttachment | null
     if (!att) return
 
@@ -142,6 +149,13 @@ export class GameRoomDO extends DurableObject {
     })
   }
 
+  override async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`GameRoomDO WebSocket error: ${message}`)
+    // The close event will follow and handle slot cleanup + reconnect grace.
+    ws.close(1011, "websocket error")
+  }
+
   override async alarm(): Promise<void> {
     const state = await this.loadState()
     const sockets = this.ctx.getWebSockets()
@@ -152,7 +166,7 @@ export class GameRoomDO extends DurableObject {
     }
 
     let changed = false
-    let removedGuestIds: string[] = []
+    const removedGuestIds: string[] = []
     state.slots = state.slots.filter((slot) => {
       if (slot.disconnectedAt === null) return true
       if (connectedGuestIds.has(slot.guestId)) {

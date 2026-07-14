@@ -192,7 +192,10 @@ export class MatchmakingQueues extends DurableObject {
       }
       await this.setMatch(opponent.ticket, { ...match, role: "host", game, createdAt: Date.now() })
       await this.setMatch(player.ticket, { ...match, role: "guest", game, createdAt: Date.now() })
-      return jsonResponse({ status: "matched", match: { ...match, role: "guest", game, createdAt: Date.now() } })
+      return jsonResponse({
+        status: "matched",
+        match: { ...match, role: "guest", game, createdAt: Date.now() },
+      })
     }
 
     await this.setQueue(game, [...queue, player])
@@ -282,7 +285,7 @@ export default {
             // the response body.
             const headers = new Headers()
             headers.set("Content-Type", "application/json")
-            for (const [key, value] of corsHeaders()) {
+            for (const [key, value] of Object.entries(corsHeaders())) {
               headers.set(key, value)
             }
             return new Response(JSON.stringify(body), {
