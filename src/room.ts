@@ -47,6 +47,8 @@ interface ConnectionAttachment {
 
 const ROOM_STATE_KEY = "room-state"
 
+export const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
+
 export class GameRoomDO extends DurableObject {
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -57,7 +59,11 @@ export class GameRoomDO extends DurableObject {
     }
 
     const url = new URL(request.url)
-    const game = url.searchParams.get("game") ?? "tictactoe"
+    const rawGame = url.searchParams.get("game")
+    const game = rawGame ?? "tictactoe"
+    if (!ALLOWED_GAMES.has(game)) {
+      return jsonResponse({ error: "unknown game" }, 400)
+    }
 
     const state = await this.loadState()
     // Pin the game tag on the first connection only. Overwriting it on
@@ -232,6 +238,7 @@ export class GameRoomDO extends DurableObject {
     })
 
     let slot: Slot
+    let isReconnect = false
 
     if (existing) {
       if (hasActiveSocket) {
@@ -242,6 +249,7 @@ export class GameRoomDO extends DurableObject {
       existing.disconnectedAt = null
       existing.displayName = displayName
       slot = existing
+      isReconnect = true
     } else {
       if (state.slots.length >= MAX_SLOTS) {
         this.sendError(ws, "unknown", "room full")
@@ -287,7 +295,7 @@ export class GameRoomDO extends DurableObject {
       }),
     )
 
-    if (opponent) {
+    if (!isReconnect && opponent) {
       this.broadcastExcept(ws, {
         type: "peer-joined",
         opponent: { guestId: slot.guestId, displayName: slot.displayName },
@@ -331,4 +339,22 @@ export class GameRoomDO extends DurableObject {
   private async saveState(state: RoomState): Promise<void> {
     await this.ctx.storage.put(ROOM_STATE_KEY, state)
   }
+}
+
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(),
+    },
+  })
 }

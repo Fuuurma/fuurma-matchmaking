@@ -72,7 +72,7 @@ Health check + queue stats.
 ### GET `/room/:roomId`
 
 WebSocket upgrade endpoint. Opens a relay connection to the `GameRoomDO` for
-the given `roomId`. Optional `?game=tictactoe|unochess` query param selects
+the given `roomId`. Optional `?game=tictactoe|uno-chess` query param selects
 the game namespace (defaults to `tictactoe`).
 
 **Wire protocol** (JSON text frames; server is a relay, not a validator):
@@ -107,7 +107,7 @@ opponent info still present.
 ## Games supported
 
 - `tictactoe`
-- `unochess`
+- `uno-chess`
 
 ## Deploy
 

@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers"
-import { GameRoomDO } from "./room"
+import { ALLOWED_GAMES, GameRoomDO } from "./room"
 
 export { GameRoomDO }
 
@@ -47,7 +47,6 @@ interface QueueState {
 const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
 const MATCH_TIMEOUT_MS = 300_000
-const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
 
 export class MatchmakingQueues extends DurableObject {
   async fetch(request: Request): Promise<Response> {
@@ -58,13 +57,17 @@ export class MatchmakingQueues extends DurableObject {
       return new Response(null, { status: 204, headers: corsHeaders() })
     }
 
-    const match = path.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
-    if (!match) {
+    const parsed = path.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
+    if (!parsed) {
       return jsonResponse({ error: "not found" }, 404)
     }
 
-    const game = match[1]
-    const action = match[2] ?? ""
+    const game = parsed[1]
+    const action = parsed[2] ?? ""
+
+    if (!ALLOWED_GAMES.has(game)) {
+      return jsonResponse({ error: "unknown game" }, 400)
+    }
 
     try {
       if (request.method === "POST" && action === "join") {
@@ -114,12 +117,6 @@ export class MatchmakingQueues extends DurableObject {
     return queue
   }
 
-  private async setQueue(game: string, queue: Player[]): Promise<void> {
-    const state = await this.loadState()
-    state.queues[game] = queue
-    await this.saveState(state)
-  }
-
   private async getMatches(): Promise<Record<string, MatchWithRole>> {
     const state = await this.loadState()
     const now = Date.now()
@@ -135,33 +132,22 @@ export class MatchmakingQueues extends DurableObject {
     return state.matches
   }
 
-  private async setMatch(ticket: string, match: MatchWithRole): Promise<void> {
-    const state = await this.loadState()
-    state.matches[ticket] = match
-    await this.saveState(state)
-  }
-
-  private async deleteMatch(ticket: string): Promise<void> {
-    const state = await this.loadState()
-    delete state.matches[ticket]
-    await this.saveState(state)
-  }
-
-  private async removeFromQueue(game: string, ticket: string): Promise<void> {
-    const queue = (await this.getQueue(game)).filter((p) => p.ticket !== ticket)
-    await this.setQueue(game, queue)
-  }
-
   private async handleJoin(game: string, body: unknown): Promise<Response> {
-    if (!ALLOWED_GAMES.has(game)) {
-      return jsonResponse({ error: "unknown game" }, 400)
-    }
     const req = body as MatchmakingRequest
     if (!req.peerId || typeof req.peerId !== "string") {
       return jsonResponse({ error: "peerId required" }, 400)
     }
 
-    const queue = await this.getQueue(game)
+    const now = Date.now()
+    const state = await this.loadState()
+
+    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
+    for (const ticket of Object.keys(state.matches)) {
+      if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
+        delete state.matches[ticket]
+      }
+    }
+
     const ticket = generateTicket()
     const roomId = generateRoomId()
 
@@ -171,12 +157,12 @@ export class MatchmakingQueues extends DurableObject {
       roomId,
       displayName: sanitizeDisplayName(req.displayName),
       guestId: req.guestId ?? "guest",
-      joinedAt: Date.now(),
+      joinedAt: now,
     }
 
-    const opponent = queue.find((p) => p.peerId !== req.peerId)
+    const opponent = queue.find((p) => p.guestId !== player.guestId && p.peerId !== player.peerId)
     if (opponent) {
-      await this.removeFromQueue(game, opponent.ticket)
+      state.queues[game] = queue.filter((p) => p.ticket !== opponent.ticket)
       const match: Match = {
         roomId: opponent.roomId,
         host: {
@@ -190,15 +176,18 @@ export class MatchmakingQueues extends DurableObject {
           guestId: player.guestId,
         },
       }
-      await this.setMatch(opponent.ticket, { ...match, role: "host", game, createdAt: Date.now() })
-      await this.setMatch(player.ticket, { ...match, role: "guest", game, createdAt: Date.now() })
+      const matchWithRole = { ...match, game, createdAt: now }
+      state.matches[opponent.ticket] = { ...matchWithRole, role: "host" }
+      state.matches[player.ticket] = { ...matchWithRole, role: "guest" }
+      await this.saveState(state)
       return jsonResponse({
         status: "matched",
-        match: { ...match, role: "guest", game, createdAt: Date.now() },
+        match: { ...match, role: "guest", game, createdAt: now },
       })
     }
 
-    await this.setQueue(game, [...queue, player])
+    state.queues[game] = [...queue, player]
+    await this.saveState(state)
     return jsonResponse({ status: "waiting", ticket, roomId })
   }
 
@@ -219,8 +208,39 @@ export class MatchmakingQueues extends DurableObject {
   }
 
   private async handleLeave(game: string, ticket: string): Promise<Response> {
-    await this.removeFromQueue(game, ticket)
-    await this.deleteMatch(ticket)
+    const now = Date.now()
+    const state = await this.loadState()
+
+    const queue = state.queues[game] ?? []
+    const filteredQueue = queue.filter(
+      (p) => now - p.joinedAt < QUEUE_TIMEOUT_MS && p.ticket !== ticket,
+    )
+    if (filteredQueue.length !== queue.length) {
+      state.queues[game] = filteredQueue
+    }
+
+    for (const t of Object.keys(state.matches)) {
+      if (now - state.matches[t].createdAt > MATCH_TIMEOUT_MS) {
+        delete state.matches[t]
+      }
+    }
+
+    const match = state.matches[ticket]
+    if (match) {
+      for (const t of Object.keys(state.matches)) {
+        if (
+          t !== ticket &&
+          state.matches[t].roomId === match.roomId &&
+          state.matches[t].game === match.game
+        ) {
+          delete state.matches[t]
+          break
+        }
+      }
+      delete state.matches[ticket]
+    }
+
+    await this.saveState(state)
     return jsonResponse({ status: "left" })
   }
 
@@ -259,7 +279,17 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() })
     }
 
-    const id = env.MATCHMAKING_QUEUES.idFromName("global")
+    const match = url.pathname.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
+    if (!match) {
+      return jsonResponse({ error: "not found" }, 404)
+    }
+
+    const game = match[1]
+    if (!ALLOWED_GAMES.has(game)) {
+      return jsonResponse({ error: "unknown game" }, 400)
+    }
+
+    const id = env.MATCHMAKING_QUEUES.idFromName(game)
     const stub = env.MATCHMAKING_QUEUES.get(id)
     const response = await stub.fetch(request)
 
