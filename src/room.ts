@@ -152,13 +152,18 @@ export class GameRoomDO extends DurableObject {
     }
 
     let changed = false
+    let removedGuestIds: string[] = []
     state.slots = state.slots.filter((slot) => {
       if (slot.disconnectedAt === null) return true
       if (connectedGuestIds.has(slot.guestId)) {
+        // Peer reconnected within the grace period — clear the disconnect
+        // marker but don't broadcast peer-left.
         slot.disconnectedAt = null
         changed = true
         return true
       }
+      // Grace expired and peer didn't reconnect — remove the slot.
+      removedGuestIds.push(slot.guestId)
       changed = true
       return false
     })
@@ -174,8 +179,12 @@ export class GameRoomDO extends DurableObject {
       await this.ctx.storage.deleteAlarm()
     }
 
-    for (const ws of sockets) {
-      this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "disconnect" }))
+    // Only broadcast peer-left if a slot was actually removed (not
+    // when a peer reconnected within the grace period).
+    if (removedGuestIds.length > 0) {
+      for (const ws of sockets) {
+        this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "disconnect" }))
+      }
     }
   }
 
