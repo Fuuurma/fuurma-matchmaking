@@ -12,9 +12,10 @@
     "lint": "biome check"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260708.1",
-    "typescript": "^5.7.2",
-    "wrangler": "^4.100.0"
+    "@biomejs/biome": "^2.5.3",
+    "@cloudflare/workers-types": "^5.20260714.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.110.0"
   },
   "packageManager": "pnpm@10.30.2"
 }

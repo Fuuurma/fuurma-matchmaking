@@ -1,155 +1,155 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from "cloudflare:workers"
 
 export interface MatchmakingRequest {
-  game: string;
-  peerId: string;
-  displayName?: string;
-  guestId?: string;
+  game: string
+  peerId: string
+  displayName?: string
+  guestId?: string
 }
 
 export interface Match {
-  roomId: string;
+  roomId: string
   host: {
-    peerId: string;
-    displayName: string;
-    guestId: string;
-  };
+    peerId: string
+    displayName: string
+    guestId: string
+  }
   guest: {
-    peerId: string;
-    displayName: string;
-    guestId: string;
-  };
+    peerId: string
+    displayName: string
+    guestId: string
+  }
 }
 
-type MatchWithRole = Match & { role: "host" | "guest" };
+type MatchWithRole = Match & { role: "host" | "guest" }
 
 export type MatchmakingResponse =
   | { status: "waiting"; ticket: string; roomId: string }
-  | { status: "matched"; match: MatchWithRole };
+  | { status: "matched"; match: MatchWithRole }
 
 interface Player {
-  ticket: string;
-  peerId: string;
-  roomId: string;
-  displayName: string;
-  guestId: string;
-  joinedAt: number;
+  ticket: string
+  peerId: string
+  roomId: string
+  displayName: string
+  guestId: string
+  joinedAt: number
 }
 
 interface QueueState {
-  queues: Record<string, Player[]>;
-  matches: Record<string, MatchWithRole>;
+  queues: Record<string, Player[]>
+  matches: Record<string, MatchWithRole>
 }
 
-const QUEUE_KEY = "queue-state";
-const QUEUE_TIMEOUT_MS = 30_000;
+const QUEUE_KEY = "queue-state"
+const QUEUE_TIMEOUT_MS = 30_000
 
 export class MatchmakingQueues extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+    super(ctx, env)
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+    const url = new URL(request.url)
+    const path = url.pathname
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: corsHeaders() })
     }
 
-    const match = path.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/);
+    const match = path.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
     if (!match) {
-      return jsonResponse({ error: "not found" }, 404);
+      return jsonResponse({ error: "not found" }, 404)
     }
 
-    const game = match[1];
-    const action = match[2] ?? "";
+    const game = match[1]
+    const action = match[2] ?? ""
 
     try {
       if (request.method === "POST" && action === "join") {
-        return await this.handleJoin(game, await request.json());
+        return await this.handleJoin(game, await request.json())
       }
 
       if (request.method === "GET" && action === "poll") {
-        const ticket = url.searchParams.get("ticket");
-        if (!ticket) return jsonResponse({ error: "ticket required" }, 400);
-        return this.handlePoll(game, ticket);
+        const ticket = url.searchParams.get("ticket")
+        if (!ticket) return jsonResponse({ error: "ticket required" }, 400)
+        return this.handlePoll(game, ticket)
       }
 
       if (request.method === "POST" && action === "leave") {
-        const body = (await request.json()) as { ticket?: string };
-        if (!body.ticket) return jsonResponse({ error: "ticket required" }, 400);
-        return this.handleLeave(game, body.ticket);
+        const body = (await request.json()) as { ticket?: string }
+        if (!body.ticket) return jsonResponse({ error: "ticket required" }, 400)
+        return this.handleLeave(game, body.ticket)
       }
 
       if (request.method === "GET" && action === "health") {
-        return this.handleHealth(game);
+        return this.handleHealth(game)
       }
 
-      return jsonResponse({ error: "not found" }, 404);
+      return jsonResponse({ error: "not found" }, 404)
     } catch (err) {
-      const message = err instanceof Error ? err.message : "server error";
-      return jsonResponse({ error: message }, 500);
+      const message = err instanceof Error ? err.message : "server error"
+      return jsonResponse({ error: message }, 500)
     }
   }
 
   private async loadState(): Promise<QueueState> {
-    const stored = await this.ctx.storage.get<QueueState>(QUEUE_KEY);
-    return stored ?? { queues: {}, matches: {} };
+    const stored = await this.ctx.storage.get<QueueState>(QUEUE_KEY)
+    return stored ?? { queues: {}, matches: {} }
   }
 
   private async saveState(state: QueueState): Promise<void> {
-    await this.ctx.storage.put(QUEUE_KEY, state);
+    await this.ctx.storage.put(QUEUE_KEY, state)
   }
 
   private async getQueue(game: string): Promise<Player[]> {
-    const state = await this.loadState();
-    const now = Date.now();
-    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS);
+    const state = await this.loadState()
+    const now = Date.now()
+    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
     if (queue.length !== (state.queues[game] ?? []).length) {
-      state.queues[game] = queue;
-      await this.saveState(state);
+      state.queues[game] = queue
+      await this.saveState(state)
     }
-    return queue;
+    return queue
   }
 
   private async setQueue(game: string, queue: Player[]): Promise<void> {
-    const state = await this.loadState();
-    state.queues[game] = queue;
-    await this.saveState(state);
+    const state = await this.loadState()
+    state.queues[game] = queue
+    await this.saveState(state)
   }
 
   private async getMatches(): Promise<Record<string, MatchWithRole>> {
-    const state = await this.loadState();
-    return state.matches;
+    const state = await this.loadState()
+    return state.matches
   }
 
   private async setMatch(ticket: string, match: MatchWithRole): Promise<void> {
-    const state = await this.loadState();
-    state.matches[ticket] = match;
-    await this.saveState(state);
+    const state = await this.loadState()
+    state.matches[ticket] = match
+    await this.saveState(state)
   }
 
   private async deleteMatch(ticket: string): Promise<void> {
-    const state = await this.loadState();
-    delete state.matches[ticket];
-    await this.saveState(state);
+    const state = await this.loadState()
+    delete state.matches[ticket]
+    await this.saveState(state)
   }
 
   private async removeFromQueue(game: string, ticket: string): Promise<void> {
-    const queue = (await this.getQueue(game)).filter((p) => p.ticket !== ticket);
-    await this.setQueue(game, queue);
+    const queue = (await this.getQueue(game)).filter((p) => p.ticket !== ticket)
+    await this.setQueue(game, queue)
   }
 
   private async handleJoin(game: string, body: unknown): Promise<Response> {
-    const req = body as MatchmakingRequest;
+    const req = body as MatchmakingRequest
     if (!req.peerId || typeof req.peerId !== "string") {
-      return jsonResponse({ error: "peerId required" }, 400);
+      return jsonResponse({ error: "peerId required" }, 400)
     }
 
-    const queue = await this.getQueue(game);
-    const ticket = generateTicket();
-    const roomId = generateRoomId();
+    const queue = await this.getQueue(game)
+    const ticket = generateTicket()
+    const roomId = generateRoomId()
 
     const player: Player = {
       ticket,
@@ -158,11 +158,11 @@ export class MatchmakingQueues extends DurableObject {
       displayName: sanitizeDisplayName(req.displayName),
       guestId: req.guestId ?? "guest",
       joinedAt: Date.now(),
-    };
+    }
 
-    const opponent = queue.find((p) => p.peerId !== req.peerId);
+    const opponent = queue.find((p) => p.peerId !== req.peerId)
     if (opponent) {
-      await this.removeFromQueue(game, opponent.ticket);
+      await this.removeFromQueue(game, opponent.ticket)
       const match: Match = {
         roomId: opponent.roomId,
         host: {
@@ -175,84 +175,80 @@ export class MatchmakingQueues extends DurableObject {
           displayName: player.displayName,
           guestId: player.guestId,
         },
-      };
-      await this.setMatch(opponent.ticket, { ...match, role: "host" });
-      await this.setMatch(player.ticket, { ...match, role: "guest" });
-      return jsonResponse({ status: "matched", match: { ...match, role: "guest" } });
+      }
+      await this.setMatch(opponent.ticket, { ...match, role: "host" })
+      await this.setMatch(player.ticket, { ...match, role: "guest" })
+      return jsonResponse({ status: "matched", match: { ...match, role: "guest" } })
     }
 
-    await this.setQueue(game, [...queue, player]);
-    return jsonResponse({ status: "waiting", ticket, roomId });
+    await this.setQueue(game, [...queue, player])
+    return jsonResponse({ status: "waiting", ticket, roomId })
   }
 
   private async handlePoll(game: string, ticket: string): Promise<Response> {
-    const matches = await this.getMatches();
-    const match = matches[ticket];
+    const matches = await this.getMatches()
+    const match = matches[ticket]
     if (match) {
-      return jsonResponse({ status: "matched", match });
+      return jsonResponse({ status: "matched", match })
     }
 
-    const queue = await this.getQueue(game);
-    const player = queue.find((p) => p.ticket === ticket);
+    const queue = await this.getQueue(game)
+    const player = queue.find((p) => p.ticket === ticket)
     if (!player) {
-      return jsonResponse({ error: "ticket not found" }, 404);
+      return jsonResponse({ error: "ticket not found" }, 404)
     }
 
-    return jsonResponse({ status: "waiting", ticket, roomId: player.roomId });
+    return jsonResponse({ status: "waiting", ticket, roomId: player.roomId })
   }
 
   private async handleLeave(game: string, ticket: string): Promise<Response> {
-    await this.removeFromQueue(game, ticket);
-    await this.deleteMatch(ticket);
-    return jsonResponse({ status: "left" });
+    await this.removeFromQueue(game, ticket)
+    await this.deleteMatch(ticket)
+    return jsonResponse({ status: "left" })
   }
 
   private async handleHealth(game: string): Promise<Response> {
-    const state = await this.loadState();
-    const queue = state.queues[game] ?? [];
-    const matches = Object.values(state.matches).filter((m) => m.roomId.startsWith(game));
+    const state = await this.loadState()
+    const queue = state.queues[game] ?? []
+    const matches = Object.values(state.matches).filter((m) => m.roomId.startsWith(game))
     return jsonResponse({
       ok: true,
       game,
       waiting: queue.length,
       matches: matches.length,
-    });
+    })
   }
-
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+    const url = new URL(request.url)
 
     if (url.pathname === "/") {
-      return jsonResponse({ ok: true, service: "fuurma-matchmaking" });
+      return jsonResponse({ ok: true, service: "fuurma-matchmaking" })
     }
 
-    const id = env.MATCHMAKING_QUEUES.idFromName("global");
-    const stub = env.MATCHMAKING_QUEUES.get(id);
-    return stub.fetch(request);
+    const id = env.MATCHMAKING_QUEUES.idFromName("global")
+    const stub = env.MATCHMAKING_QUEUES.get(id)
+    return stub.fetch(request)
   },
-};
+}
 
 interface Env {
-  MATCHMAKING_QUEUES: DurableObjectNamespace<MatchmakingQueues>;
+  MATCHMAKING_QUEUES: DurableObjectNamespace<MatchmakingQueues>
 }
 
 function generateTicket(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 function generateRoomId(): string {
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
 }
 
 function sanitizeDisplayName(value: string | undefined | null): string {
-  const safe = (value ?? "Guest")
-    .replace(/[<>]/g, "")
-    .trim()
-    .slice(0, 20);
-  return safe.length >= 2 ? safe : "Guest";
+  const safe = (value ?? "Guest").replace(/[<>]/g, "").trim().slice(0, 20)
+  return safe.length >= 2 ? safe : "Guest"
 }
 
 function corsHeaders(): Record<string, string> {
@@ -260,7 +256,7 @@ function corsHeaders(): Record<string, string> {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-  };
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -270,5 +266,5 @@ function jsonResponse(body: unknown, status = 200): Response {
       "Content-Type": "application/json",
       ...corsHeaders(),
     },
-  });
+  })
 }
