@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers"
-import { ALLOWED_GAMES, GameRoomDO } from "./room"
+import { GameRoomDO } from "./room"
+import { ALLOWED_GAMES, corsHeaders, jsonResponse, logEvent, sanitizeDisplayName } from "./utils"
 
 export { GameRoomDO }
 
@@ -93,6 +94,7 @@ export class MatchmakingQueues extends DurableObject {
       return jsonResponse({ error: "not found" }, 404)
     } catch (err) {
       const message = err instanceof Error ? err.message : "server error"
+      logEvent("error", "matchmaking_request_failed", { game, action, message })
       return jsonResponse({ error: message }, 500)
     }
   }
@@ -141,6 +143,7 @@ export class MatchmakingQueues extends DurableObject {
     const now = Date.now()
     const state = await this.loadState()
 
+    // Prune expired queue entries and matches in one pass.
     const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
     for (const ticket of Object.keys(state.matches)) {
       if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
@@ -158,6 +161,23 @@ export class MatchmakingQueues extends DurableObject {
       displayName: sanitizeDisplayName(req.displayName),
       guestId: req.guestId ?? "guest",
       joinedAt: now,
+    }
+
+    // Guard: one active queue entry per peerId. If the same player re-joins
+    // (e.g. lost their ticket and retried), return their existing waiting
+    // ticket instead of creating a duplicate queue entry.
+    const existingEntry = queue.find((p) => p.peerId === player.peerId)
+    if (existingEntry) {
+      logEvent("warn", "duplicate_join_returned_existing", {
+        game,
+        peerId: player.peerId,
+        ticket: existingEntry.ticket,
+      })
+      return jsonResponse({
+        status: "waiting",
+        ticket: existingEntry.ticket,
+        roomId: existingEntry.roomId,
+      })
     }
 
     const opponent = queue.find((p) => p.guestId !== player.guestId && p.peerId !== player.peerId)
@@ -344,27 +364,4 @@ function generateTicket(): string {
 
 function generateRoomId(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()
-}
-
-function sanitizeDisplayName(value: string | undefined | null): string {
-  const safe = (value ?? "Guest").replace(/[<>]/g, "").trim().slice(0, 20)
-  return safe.length >= 2 ? safe : "Guest"
-}
-
-function corsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  }
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders(),
-    },
-  })
 }

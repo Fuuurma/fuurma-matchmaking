@@ -1,4 +1,11 @@
 import { DurableObject } from "cloudflare:workers"
+import {
+  ALLOWED_GAMES,
+  MAX_MESSAGE_BYTES,
+  jsonResponse,
+  logEvent,
+  sanitizeDisplayName,
+} from "./utils"
 
 /**
  * Per-room WebSocket relay for two-player turn-based games.
@@ -47,8 +54,6 @@ interface ConnectionAttachment {
 
 const ROOM_STATE_KEY = "room-state"
 
-export const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
-
 export class GameRoomDO extends DurableObject {
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -81,6 +86,13 @@ export class GameRoomDO extends DurableObject {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    // Reject oversized frames early to prevent memory abuse.
+    const byteLength = typeof message === "string" ? message.length : message.byteLength
+    if (byteLength > MAX_MESSAGE_BYTES) {
+      this.sendError(ws, "invalid", `message too large (max ${MAX_MESSAGE_BYTES} bytes)`)
+      return
+    }
+
     if (typeof message !== "string") {
       this.sendError(ws, "invalid", "expected string frame")
       return
@@ -163,7 +175,7 @@ export class GameRoomDO extends DurableObject {
 
   override async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error)
-    console.error(`GameRoomDO WebSocket error: ${message}`)
+    logEvent("error", "websocket_error", { message })
     // The close event will follow and handle slot cleanup + reconnect grace.
     ws.close(1011, "websocket error")
   }
@@ -224,8 +236,7 @@ export class GameRoomDO extends DurableObject {
       return
     }
 
-    const rawName = typeof msg.displayName === "string" ? msg.displayName : ""
-    const displayName = rawName.replace(/[<>]/g, "").trim().slice(0, 20) || "Guest"
+    const displayName = sanitizeDisplayName(msg.displayName)
     const requestedRole =
       msg.role === "host" || msg.role === "guest" ? (msg.role as "host" | "guest") : null
 
@@ -339,22 +350,4 @@ export class GameRoomDO extends DurableObject {
   private async saveState(state: RoomState): Promise<void> {
     await this.ctx.storage.put(ROOM_STATE_KEY, state)
   }
-}
-
-function corsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  }
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders(),
-    },
-  })
 }

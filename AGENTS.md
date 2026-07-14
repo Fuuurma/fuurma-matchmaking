@@ -32,7 +32,7 @@ Shared Cloudflare Worker for quick matchmaking and WebSocket room relay for the 
 ## Stack
 
 - **Runtime**: Cloudflare Workers (`compatibility_date: 2026-07-10`, `nodejs_compat`)
-- **Durable Objects**: `MatchmakingQueues` (global queue state) and `GameRoomDO` (per-room WebSocket relay)
+- **Durable Objects**: `MatchmakingQueues` (per-game queue state) and `GameRoomDO` (per-room WebSocket relay)
 - **Language**: TypeScript (strict) via `wrangler`
 - **Testing**: Vitest + `@cloudflare/vitest-pool-workers`
 - **Lint/Format**: Biome
@@ -55,7 +55,9 @@ pnpm run check           # tsc --noEmit
 |------|---------|
 | `src/index.ts` | Main Worker fetch handler + `MatchmakingQueues` Durable Object |
 | `src/room.ts` | `GameRoomDO` — WebSocket relay/room logic |
-| `src/room.test.ts` | Durable Object tests |
+| `src/utils.ts` | Shared helpers: sanitization, CORS, JSON response, logging, constants |
+| `src/index.test.ts` | Matchmaking queue tests |
+| `src/room.test.ts` | GameRoom Durable Object tests |
 | `wrangler.jsonc` | Worker config, Durable Object bindings, migrations |
 
 ## API surface

@@ -203,4 +203,52 @@ describe("GameRoomDO", () => {
     host.close()
     guest.close()
   })
+
+  it("rejects oversized WebSocket messages", async () => {
+    const ws = await openSocket(roomId("bigmsg"))
+    send(ws, { type: "hello", guestId: "big", displayName: "B" })
+    await nextMessage(ws)
+    // Send a message exceeding the 64 KiB cap.
+    const oversized = { type: "move", payload: "x".repeat(70_000) }
+    ws.send(JSON.stringify(oversized))
+    const raw = JSON.parse(await nextMessage(ws))
+    expect(raw.type).toBe("error")
+    expect(raw.code).toBe("invalid")
+    expect(raw.message).toMatch(/too large/i)
+    ws.close()
+  })
+
+  it("rejects relay from sockets that have not sent hello", async () => {
+    const ws = await openSocket(roomId("nohello2"))
+    // Send a game message before hello — should be rejected.
+    send(ws, { type: "move", index: 0 })
+    const raw = JSON.parse(await nextMessage(ws))
+    expect(raw.type).toBe("error")
+    expect(raw.code).toBe("invalid")
+    expect(raw.message).toMatch(/hello first/i)
+    ws.close()
+  })
+
+  it("strips HTML chars from displayName in hello", async () => {
+    const ws = await openSocket(roomId("xss"))
+    send(ws, { type: "hello", guestId: "xss1", displayName: '<img src=x onerror=alert(1)>' })
+    const welcome = JSON.parse(await nextMessage(ws))
+    expect(welcome.type).toBe("welcome")
+    // The sanitized name should not contain HTML chars.
+    expect(welcome.role).toBe("host")
+    ws.close()
+
+    // Connect a second peer to verify the sanitized name is relayed.
+    const rid2 = roomId("xss2")
+    const host = await openSocket(rid2)
+    send(host, { type: "hello", guestId: "xh", displayName: '<b>Bold</b>' })
+    await nextMessage(host)
+    const guest = await openSocket(rid2)
+    send(guest, { type: "hello", guestId: "xg", displayName: "Guest" })
+    const guestWelcome = JSON.parse(await nextMessage(guest))
+    expect(guestWelcome.opponent?.displayName).not.toContain("<")
+    expect(guestWelcome.opponent?.displayName).not.toContain(">")
+    host.close()
+    guest.close()
+  })
 })

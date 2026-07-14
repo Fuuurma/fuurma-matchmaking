@@ -154,4 +154,43 @@ describe("MatchmakingQueues via worker fetch", () => {
     const body = (await response.json()) as { error: string }
     expect(body.error).toBe("unknown game")
   })
+
+  it("returns existing ticket when same peerId re-joins", async () => {
+    const first = await join("tictactoe", "peer-dup", "gd1", "Dup")
+    const firstBody = (await first.json()) as { status: string; ticket: string; roomId: string }
+    expect(firstBody.status).toBe("waiting")
+
+    const second = await join("tictactoe", "peer-dup", "gd1-different", "Dup2")
+    const secondBody = (await second.json()) as { status: string; ticket: string; roomId: string }
+    expect(secondBody.status).toBe("waiting")
+    // Same ticket returned — no duplicate queue entry.
+    expect(secondBody.ticket).toBe(firstBody.ticket)
+    expect(secondBody.roomId).toBe(firstBody.roomId)
+
+    // Health should show only 1 waiting player.
+    const h = await health("tictactoe")
+    const hBody = (await h.json()) as { waiting: number }
+    expect(hBody.waiting).toBe(1)
+
+    await leave("tictactoe", firstBody.ticket)
+  })
+
+  it("sanitizes display names (strips HTML chars and control chars)", async () => {
+    const host = await join("tictactoe", "peer-san", "gs1", '<script>alert(1)</script>')
+    const hostBody = (await host.json()) as { status: string; ticket: string }
+    expect(hostBody.status).toBe("waiting")
+
+    const guest = await join("tictactoe", "peer-san2", "gs2", "Bob")
+    const guestBody = (await guest.json()) as {
+      status: string
+      match: { host: { displayName: string }; guest: { displayName: string } }
+    }
+    expect(guestBody.status).toBe("matched")
+    // HTML tags stripped, leaving "scriptalert(1)/script" which is >= 2 chars.
+    expect(guestBody.match.host.displayName).not.toContain("<")
+    expect(guestBody.match.host.displayName).not.toContain(">")
+    expect(guestBody.match.guest.displayName).toBe("Bob")
+
+    await leave("tictactoe", hostBody.ticket)
+  })
 })
