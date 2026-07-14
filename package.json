@@ -9,12 +9,15 @@
     "deploy:check": "wrangler deploy --dry-run",
     "check": "tsc --noEmit",
     "format": "biome format --write",
-    "lint": "biome check"
+    "lint": "biome check",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.3",
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
     "@cloudflare/workers-types": "^5.20260714.1",
     "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
     "wrangler": "^4.110.0"
   },
   "packageManager": "pnpm@10.30.2"

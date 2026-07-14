@@ -4,11 +4,19 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-10",
   "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
   "durable_objects": {
     "bindings": [
       {
         "name": "MATCHMAKING_QUEUES",
         "class_name": "MatchmakingQueues"
+      },
+      {
+        "name": "GAME_ROOM",
+        "class_name": "GameRoomDO"
       }
     ]
   },
@@ -16,6 +24,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["MatchmakingQueues"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["GameRoomDO"]
     }
   ]
 }

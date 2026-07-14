@@ -1,4 +1,7 @@
 import { DurableObject } from "cloudflare:workers"
+import { GameRoomDO } from "./room"
+
+export { GameRoomDO }
 
 export interface MatchmakingRequest {
   game: string
@@ -21,7 +24,7 @@ export interface Match {
   }
 }
 
-type MatchWithRole = Match & { role: "host" | "guest" }
+type MatchWithRole = Match & { role: "host" | "guest"; game: string; createdAt: number }
 
 export type MatchmakingResponse =
   | { status: "waiting"; ticket: string; roomId: string }
@@ -43,12 +46,10 @@ interface QueueState {
 
 const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
+const MATCH_TIMEOUT_MS = 300_000
+const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
 
 export class MatchmakingQueues extends DurableObject {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env)
-  }
-
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const path = url.pathname
@@ -121,6 +122,16 @@ export class MatchmakingQueues extends DurableObject {
 
   private async getMatches(): Promise<Record<string, MatchWithRole>> {
     const state = await this.loadState()
+    const now = Date.now()
+    const before = Object.keys(state.matches).length
+    for (const ticket of Object.keys(state.matches)) {
+      if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
+        delete state.matches[ticket]
+      }
+    }
+    if (Object.keys(state.matches).length !== before) {
+      await this.saveState(state)
+    }
     return state.matches
   }
 
@@ -142,6 +153,9 @@ export class MatchmakingQueues extends DurableObject {
   }
 
   private async handleJoin(game: string, body: unknown): Promise<Response> {
+    if (!ALLOWED_GAMES.has(game)) {
+      return jsonResponse({ error: "unknown game" }, 400)
+    }
     const req = body as MatchmakingRequest
     if (!req.peerId || typeof req.peerId !== "string") {
       return jsonResponse({ error: "peerId required" }, 400)
@@ -176,9 +190,9 @@ export class MatchmakingQueues extends DurableObject {
           guestId: player.guestId,
         },
       }
-      await this.setMatch(opponent.ticket, { ...match, role: "host" })
-      await this.setMatch(player.ticket, { ...match, role: "guest" })
-      return jsonResponse({ status: "matched", match: { ...match, role: "guest" } })
+      await this.setMatch(opponent.ticket, { ...match, role: "host", game, createdAt: Date.now() })
+      await this.setMatch(player.ticket, { ...match, role: "guest", game, createdAt: Date.now() })
+      return jsonResponse({ status: "matched", match: { ...match, role: "guest", game, createdAt: Date.now() } })
     }
 
     await this.setQueue(game, [...queue, player])
@@ -210,7 +224,7 @@ export class MatchmakingQueues extends DurableObject {
   private async handleHealth(game: string): Promise<Response> {
     const state = await this.loadState()
     const queue = state.queues[game] ?? []
-    const matches = Object.values(state.matches).filter((m) => m.roomId.startsWith(game))
+    const matches = Object.values(state.matches).filter((m) => m.game === game)
     return jsonResponse({
       ok: true,
       game,
@@ -228,22 +242,76 @@ export default {
       return jsonResponse({ ok: true, service: "fuurma-matchmaking" })
     }
 
+    // WebSocket relay route: /room/{roomId}
+    if (request.method === "GET" && url.pathname.startsWith("/room/")) {
+      const roomId = url.pathname.slice("/room/".length)
+      if (!/^[A-Za-z0-9]{4,16}$/.test(roomId)) {
+        return jsonResponse({ error: "invalid room id" }, 400)
+      }
+      const id = env.GAME_ROOM.idFromName(roomId)
+      const stub = env.GAME_ROOM.get(id)
+      return stub.fetch(request)
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() })
+    }
+
     const id = env.MATCHMAKING_QUEUES.idFromName("global")
     const stub = env.MATCHMAKING_QUEUES.get(id)
-    return stub.fetch(request)
+    const response = await stub.fetch(request)
+
+    // Inject wsUrl into matched responses so the client can connect directly.
+    const contentType = response.headers.get("Content-Type") ?? ""
+    if (response.ok && contentType.includes("application/json")) {
+      try {
+        const cloned = response.clone()
+        const body = (await cloned.json()) as Record<string, unknown> | null
+        if (
+          body &&
+          typeof body === "object" &&
+          "match" in body &&
+          body.match &&
+          typeof body.match === "object"
+        ) {
+          const match = body.match as Record<string, unknown>
+          if (typeof match.roomId === "string" && typeof match.wsUrl !== "string") {
+            match.wsUrl = buildWsUrl(request.url, match.roomId)
+            // Build fresh headers — the original Content-Length is now stale
+            // because we added the wsUrl field, and reusing it would truncate
+            // the response body.
+            const headers = new Headers()
+            headers.set("Content-Type", "application/json")
+            for (const [key, value] of corsHeaders()) {
+              headers.set(key, value)
+            }
+            return new Response(JSON.stringify(body), {
+              status: response.status,
+              headers,
+            })
+          }
+        }
+      } catch {
+        // not JSON; return original
+      }
+    }
+
+    return response
   },
 }
 
-interface Env {
-  MATCHMAKING_QUEUES: DurableObjectNamespace<MatchmakingQueues>
+function buildWsUrl(requestUrl: string, roomId: string): string {
+  const u = new URL(`/room/${roomId}`, requestUrl)
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:"
+  return u.toString()
 }
 
 function generateTicket(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  return `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
 }
 
 function generateRoomId(): string {
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()
 }
 
 function sanitizeDisplayName(value: string | undefined | null): string {
