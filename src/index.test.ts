@@ -176,7 +176,7 @@ describe("MatchmakingQueues via worker fetch", () => {
   })
 
   it("sanitizes display names (strips HTML chars and control chars)", async () => {
-    const host = await join("tictactoe", "peer-san", "gs1", '<script>alert(1)</script>')
+    const host = await join("tictactoe", "peer-san", "gs1", "<script>alert(1)</script>")
     const hostBody = (await host.json()) as { status: string; ticket: string }
     expect(hostBody.status).toBe("waiting")
 

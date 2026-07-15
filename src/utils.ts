@@ -20,8 +20,8 @@ export const MAX_DISPLAY_NAME_LENGTH = 20
  */
 export function sanitizeDisplayName(value: string | undefined | null): string {
   const safe = (value ?? "Guest")
-    // Strip control chars (0x00-0x1F, 0x7F) and HTML-special chars.
-    .replace(/[\x00-\x1F\x7F<>"'`]/g, "")
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional sanitizer
+    .replace(/[\u0000-\u001F\u007F<>"'`]/g, "")
     .trim()
     .slice(0, MAX_DISPLAY_NAME_LENGTH)
   return safe.length >= 2 ? safe : "Guest"

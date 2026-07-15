@@ -231,7 +231,7 @@ describe("GameRoomDO", () => {
 
   it("strips HTML chars from displayName in hello", async () => {
     const ws = await openSocket(roomId("xss"))
-    send(ws, { type: "hello", guestId: "xss1", displayName: '<img src=x onerror=alert(1)>' })
+    send(ws, { type: "hello", guestId: "xss1", displayName: "<img src=x onerror=alert(1)>" })
     const welcome = JSON.parse(await nextMessage(ws))
     expect(welcome.type).toBe("welcome")
     // The sanitized name should not contain HTML chars.
@@ -241,7 +241,7 @@ describe("GameRoomDO", () => {
     // Connect a second peer to verify the sanitized name is relayed.
     const rid2 = roomId("xss2")
     const host = await openSocket(rid2)
-    send(host, { type: "hello", guestId: "xh", displayName: '<b>Bold</b>' })
+    send(host, { type: "hello", guestId: "xh", displayName: "<b>Bold</b>" })
     await nextMessage(host)
     const guest = await openSocket(rid2)
     send(guest, { type: "hello", guestId: "xg", displayName: "Guest" })

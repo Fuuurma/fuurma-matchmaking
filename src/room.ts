@@ -1,9 +1,9 @@
 import { DurableObject } from "cloudflare:workers"
 import {
   ALLOWED_GAMES,
-  MAX_MESSAGE_BYTES,
   jsonResponse,
   logEvent,
+  MAX_MESSAGE_BYTES,
   sanitizeDisplayName,
 } from "./utils"
 
