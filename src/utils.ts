@@ -11,6 +11,10 @@ export const MAX_MESSAGE_BYTES = 64 * 1024
 /** Max length of a display name after sanitization. */
 export const MAX_DISPLAY_NAME_LENGTH = 20
 
+/** Bounds for matchmaking identity fields accepted from browsers. */
+export const MAX_PEER_ID_LENGTH = 128
+export const MAX_GUEST_ID_LENGTH = 64
+
 /**
  * Sanitize a user-supplied display name for safe storage and relay.
  *
@@ -37,12 +41,17 @@ export function corsHeaders(): Record<string, string> {
 }
 
 /** Build a JSON Response with CORS headers. */
-export function jsonResponse(body: unknown, status = 200): Response {
+export function jsonResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json",
       ...corsHeaders(),
+      ...extraHeaders,
     },
   })
 }

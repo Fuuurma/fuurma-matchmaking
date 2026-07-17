@@ -19,7 +19,7 @@ import {
  * Reconnect grace: when a socket disconnects, the slot is kept for 30s.
  * A new socket presenting the same `guestId` reattaches and gets the same
  * role. After the grace expires, an `alarm` cleans up the orphan slot and
- * notifies the remaining peer via `peer-left`.
+ * notifies the remaining peer via `peer-left` with reason `expired`.
  *
  * Spec: ../../newProjectsPlanner/migrations/2026-07-games-do-websocket-migration.md
  */
@@ -32,7 +32,15 @@ const MAX_SLOTS = 2
  * peer-to-peer — a malicious client could otherwise spoof `peer-left`
  * or `welcome` to trick the other peer into a wrong state.
  */
-const RESERVED_TYPES = new Set(["hello", "ping", "welcome", "peer-joined", "peer-left", "error"])
+const RESERVED_TYPES = new Set([
+  "hello",
+  "ping",
+  "welcome",
+  "peer-joined",
+  "peer-reconnected",
+  "peer-left",
+  "error",
+])
 
 interface Slot {
   guestId: string
@@ -77,6 +85,8 @@ export class GameRoomDO extends DurableObject {
     if (state.slots.length === 0 && state.game !== game) {
       state.game = game
       await this.saveState(state)
+    } else if (state.slots.length > 0 && state.game !== game) {
+      return jsonResponse({ error: "room belongs to another game" }, 409)
     }
 
     const pair = new WebSocketPair()
@@ -147,7 +157,7 @@ export class GameRoomDO extends DurableObject {
     ws: WebSocket,
     code: number,
     reason: string,
-    wasClean: boolean,
+    _wasClean: boolean,
   ): Promise<void> {
     // Auto-reply to the close frame (safe even with auto-reply enabled).
     try {
@@ -169,7 +179,7 @@ export class GameRoomDO extends DurableObject {
 
     this.broadcastExcept(ws, {
       type: "peer-left",
-      reason: wasClean ? "closed" : "disconnect",
+      reason: code === 1000 && reason === "client closing" ? "closed" : "disconnect",
     })
   }
 
@@ -221,7 +231,7 @@ export class GameRoomDO extends DurableObject {
     // when a peer reconnected within the grace period).
     if (removedGuestIds.length > 0) {
       for (const ws of sockets) {
-        this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "disconnect" }))
+        this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "expired" }))
       }
     }
   }
@@ -309,6 +319,11 @@ export class GameRoomDO extends DurableObject {
     if (!isReconnect && opponent) {
       this.broadcastExcept(ws, {
         type: "peer-joined",
+        opponent: { guestId: slot.guestId, displayName: slot.displayName },
+      })
+    } else if (isReconnect && opponent) {
+      this.broadcastExcept(ws, {
+        type: "peer-reconnected",
         opponent: { guestId: slot.guestId, displayName: slot.displayName },
       })
     }

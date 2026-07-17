@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-10",
   "compatibility_flags": ["nodejs_compat"],
+  "dev": {
+    "ip": "127.0.0.1",
+    "port": 8787
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

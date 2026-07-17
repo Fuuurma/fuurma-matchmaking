@@ -39,6 +39,48 @@ async function health(game: string) {
 }
 
 describe("MatchmakingQueues via worker fetch", () => {
+  it("rejects malformed and oversized join payloads", async () => {
+    const malformed = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", {
+        method: "POST",
+        body: "not-json",
+        headers: { "Content-Type": "application/json" },
+      }),
+      env,
+    )
+    expect(malformed.status).toBe(400)
+
+    const oversized = await join("tictactoe", "x".repeat(129), "g-bad", "Bad")
+    expect(oversized.status).toBe(400)
+
+    const oversizedGuest = await join("tictactoe", "peer-bad-guest", "g".repeat(65), "Bad")
+    expect(oversizedGuest.status).toBe(400)
+  })
+
+  it("throttles repeated joins from the same client address", async () => {
+    const headers = {
+      "Content-Type": "application/json",
+      "CF-Connecting-IP": "198.51.100.88",
+    }
+    let last: Response | null = null
+    for (let i = 0; i < 21; i += 1) {
+      last = await worker.fetch(
+        new Request("https://test.invalid/api/matchmaking/uno-chess/join", {
+          method: "POST",
+          body: JSON.stringify({
+            peerId: `rate-peer-${i}`,
+            guestId: `rate-guest-${i}`,
+            displayName: "Rate",
+          }),
+          headers,
+        }),
+        env,
+      )
+    }
+    expect(last?.status).toBe(429)
+    expect(last?.headers.get("Retry-After")).toBeTruthy()
+  })
+
   it("join returns waiting and then pairs two players", async () => {
     const host = await join("tictactoe", "peer-1", "g1", "Alice")
     expect(host.status).toBe(200)

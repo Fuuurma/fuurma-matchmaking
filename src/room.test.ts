@@ -1,16 +1,16 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
-import { env } from "cloudflare:test"
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 
 function roomId(seed: string): string {
   return `T${seed.padEnd(11, "0").slice(0, 11)}` // "T" + 11 chars = 12 chars total
 }
 
-async function openSocket(roomId: string): Promise<WebSocket> {
+async function openSocket(roomId: string, game = "tictactoe"): Promise<WebSocket> {
   const id = env.GAME_ROOM.idFromName(roomId)
   const stub = env.GAME_ROOM.get(id)
-  const req = new Request(`https://test.invalid/?game=tictactoe`, {
+  const req = new Request(`https://test.invalid/?game=${game}`, {
     headers: { Upgrade: "websocket" },
   })
   const resp = await stub.fetch(req)
@@ -25,11 +25,11 @@ function send(ws: WebSocket, payload: unknown): void {
   ws.send(JSON.stringify(payload))
 }
 
-function nextMessage(ws: WebSocket, timeoutMs = 1000): Promise<string> {
+function nextMessage(ws: WebSocket, timeoutMs = 1000, label = ""): Promise<string> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       ws.removeEventListener("message", onMessage as EventListener)
-      reject(new Error(`nextMessage timeout after ${timeoutMs}ms`))
+      reject(new Error(`${label ? `${label}: ` : ""}nextMessage timeout after ${timeoutMs}ms`))
     }, timeoutMs)
     function onMessage(event: MessageEvent) {
       clearTimeout(timer)
@@ -118,6 +118,22 @@ describe("GameRoomDO", () => {
     third.close()
   })
 
+  it("rejects reusing a room for another game", async () => {
+    const rid = roomId("gameiso")
+    const ttt = await openSocket(rid, "tictactoe")
+    send(ttt, { type: "hello", guestId: "ttt", displayName: "TicTacToe" })
+    await nextMessage(ttt)
+
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const response = await stub.fetch(
+      new Request("https://test.invalid/?game=uno-chess", {
+        headers: { Upgrade: "websocket" },
+      }),
+    )
+    expect(response.status).toBe(409)
+    ttt.close()
+  })
+
   it("responds to ping with pong", async () => {
     const ws = await openSocket(roomId("pingpong"))
     send(ws, { type: "hello", guestId: "p1", displayName: "P" })
@@ -181,6 +197,68 @@ describe("GameRoomDO", () => {
     guest.close()
     const evt = JSON.parse(await nextMessage(host))
     expect(evt.type).toBe("peer-left")
+    host.close()
+  })
+
+  it("keeps a reconnecting peer alive until the grace alarm expires", async () => {
+    const rid = roomId("regrace")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host)
+
+    guest.close()
+    expect(JSON.parse(await nextMessage(host, 1000, "initial disconnect"))).toMatchObject({
+      type: "peer-left",
+      reason: "disconnect",
+    })
+
+    const reconnected = await openSocket(rid)
+    send(reconnected, { type: "hello", guestId: "g", displayName: "G" })
+    expect(JSON.parse(await nextMessage(reconnected, 1000, "reconnect welcome"))).toMatchObject({
+      type: "welcome",
+      role: "guest",
+    })
+    expect(JSON.parse(await nextMessage(host, 1000, "reconnect notification"))).toMatchObject({
+      type: "peer-reconnected",
+      opponent: { guestId: "g" },
+    })
+
+    reconnected.close()
+    await nextMessage(host, 1000, "final disconnect")
+    host.close()
+  })
+
+  it("notifies the remaining peer when the reconnect grace expires", async () => {
+    const rid = roomId("expired")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.put("room-state", {
+        game: "tictactoe",
+        slots: [
+          { guestId: "h", displayName: "H", role: "host", disconnectedAt: null },
+          { guestId: "g", displayName: "G", role: "guest", disconnectedAt: Date.now() - 1 },
+        ],
+      }),
+    )
+    expect(await runDurableObjectAlarm(stub)).toBe(false)
+
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.setAlarm(Date.now() + 30_000),
+    )
+    const expiredMessage = nextMessage(host, 1000, "expired notification")
+    expect(await runDurableObjectAlarm(stub)).toBe(true)
+    expect(JSON.parse(await expiredMessage)).toMatchObject({
+      type: "peer-left",
+      reason: "expired",
+    })
     host.close()
   })
 

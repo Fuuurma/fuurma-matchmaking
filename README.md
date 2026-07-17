@@ -94,15 +94,29 @@ Server → client when the other side arrives:
 
 Server → client when the other side disconnects:
 ```json
-{ "type": "peer-left", "reason": "disconnect" | "closed" }
+{ "type": "peer-left", "reason": "disconnect" | "closed" | "expired" }
 ```
+
+`disconnect` is transient and retains the player slot for 30 seconds. A
+reconnect using the same `guestId` receives `welcome` and the remaining peer
+receives:
+
+```json
+{ "type": "peer-reconnected", "opponent": { "guestId": "guest:abc", "displayName": "Guest-1234" } }
+```
+
+`closed` and `expired` are final room lifecycle events.
 
 Application messages (`move`, `rematch-request`, `rematch-accept`, `resign`,
 `ping`) are relayed verbatim to the other socket. `ping` → `pong`.
 
 **Reconnect:** a new WebSocket presenting the same `guestId` within 30s of a
 disconnect reattaches to the same slot and is told `welcome` again with the
-opponent info still present.
+opponent info still present. The other client receives `peer-reconnected`.
+
+Join requests are bounded and rate-limited per client address. The Worker
+rejects malformed JSON, oversized identifiers, invalid leave tickets, and
+cross-game room access.
 
 ## Games supported
 
@@ -117,7 +131,7 @@ pnpm run deploy:check
 pnpm run deploy
 ```
 
-Live URL: `https://fuurma-matchmaking.sergiformatjer1999.workers.dev`
+Preview URL: `https://fuurma-matchmaking.sergiformatjer1999.workers.dev`
 
 ## Env
 

@@ -1,6 +1,14 @@
 import { DurableObject } from "cloudflare:workers"
 import { GameRoomDO } from "./room"
-import { ALLOWED_GAMES, corsHeaders, jsonResponse, logEvent, sanitizeDisplayName } from "./utils"
+import {
+  ALLOWED_GAMES,
+  corsHeaders,
+  jsonResponse,
+  logEvent,
+  MAX_GUEST_ID_LENGTH,
+  MAX_PEER_ID_LENGTH,
+  sanitizeDisplayName,
+} from "./utils"
 
 export { GameRoomDO }
 
@@ -43,11 +51,14 @@ interface Player {
 interface QueueState {
   queues: Record<string, Player[]>
   matches: Record<string, MatchWithRole>
+  rateLimits?: Record<string, { count: number; windowStartedAt: number }>
 }
 
 const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
 const MATCH_TIMEOUT_MS = 300_000
+const JOIN_RATE_WINDOW_MS = 60_000
+const MAX_JOIN_ATTEMPTS_PER_WINDOW = 20
 
 export class MatchmakingQueues extends DurableObject {
   async fetch(request: Request): Promise<Response> {
@@ -72,7 +83,9 @@ export class MatchmakingQueues extends DurableObject {
 
     try {
       if (request.method === "POST" && action === "join") {
-        return await this.handleJoin(game, await request.json())
+        const body = await parseJson(request)
+        if (!body.ok) return body.response
+        return await this.handleJoin(game, body.value, request)
       }
 
       if (request.method === "GET" && action === "poll") {
@@ -82,9 +95,16 @@ export class MatchmakingQueues extends DurableObject {
       }
 
       if (request.method === "POST" && action === "leave") {
-        const body = (await request.json()) as { ticket?: string }
-        if (!body.ticket) return jsonResponse({ error: "ticket required" }, 400)
-        return this.handleLeave(game, body.ticket)
+        const body = await parseJson(request)
+        if (!body.ok) return body.response
+        if (!body.value || typeof body.value !== "object" || Array.isArray(body.value)) {
+          return jsonResponse({ error: "object body required" }, 400)
+        }
+        const ticket = (body.value as { ticket?: unknown }).ticket
+        if (typeof ticket !== "string" || !isValidTicket(ticket)) {
+          return jsonResponse({ error: "valid ticket required" }, 400)
+        }
+        return this.handleLeave(game, ticket)
       }
 
       if (request.method === "GET" && action === "health") {
@@ -134,14 +154,37 @@ export class MatchmakingQueues extends DurableObject {
     return state.matches
   }
 
-  private async handleJoin(game: string, body: unknown): Promise<Response> {
-    const req = body as MatchmakingRequest
-    if (!req.peerId || typeof req.peerId !== "string") {
-      return jsonResponse({ error: "peerId required" }, 400)
+  private async handleJoin(game: string, body: unknown, request: Request): Promise<Response> {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ error: "object body required" }, 400)
+    }
+    const req = body as Partial<MatchmakingRequest>
+    if (
+      typeof req.peerId !== "string" ||
+      req.peerId.length < 1 ||
+      req.peerId.length > MAX_PEER_ID_LENGTH
+    ) {
+      return jsonResponse({ error: `peerId required (1-${MAX_PEER_ID_LENGTH} chars)` }, 400)
+    }
+    if (
+      req.guestId !== undefined &&
+      (typeof req.guestId !== "string" ||
+        req.guestId.length < 1 ||
+        req.guestId.length > MAX_GUEST_ID_LENGTH)
+    ) {
+      return jsonResponse({ error: `guestId must be 1-${MAX_GUEST_ID_LENGTH} chars` }, 400)
+    }
+    if (
+      req.displayName !== undefined &&
+      (typeof req.displayName !== "string" || req.displayName.length > 256)
+    ) {
+      return jsonResponse({ error: "displayName must be at most 256 chars" }, 400)
     }
 
     const now = Date.now()
     const state = await this.loadState()
+    const rateLimit = await this.consumeJoinAttempt(state, request, now)
+    if (rateLimit) return rateLimit
 
     // Prune expired queue entries and matches in one pass.
     const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
@@ -159,7 +202,7 @@ export class MatchmakingQueues extends DurableObject {
       peerId: req.peerId,
       roomId,
       displayName: sanitizeDisplayName(req.displayName),
-      guestId: req.guestId ?? "guest",
+      guestId: req.guestId ?? crypto.randomUUID(),
       joinedAt: now,
     }
 
@@ -209,6 +252,39 @@ export class MatchmakingQueues extends DurableObject {
     state.queues[game] = [...queue, player]
     await this.saveState(state)
     return jsonResponse({ status: "waiting", ticket, roomId })
+  }
+
+  private async consumeJoinAttempt(
+    state: QueueState,
+    request: Request,
+    now: number,
+  ): Promise<Response | null> {
+    const ip =
+      request.headers.get("CF-Connecting-IP") ??
+      request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
+      "unknown"
+    const rateLimits = state.rateLimits ?? {}
+    for (const [key, entry] of Object.entries(rateLimits)) {
+      if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) delete rateLimits[key]
+    }
+
+    const current = rateLimits[ip]
+    if (current && now - current.windowStartedAt < JOIN_RATE_WINDOW_MS) {
+      if (current.count >= MAX_JOIN_ATTEMPTS_PER_WINDOW) {
+        return jsonResponse({ error: "too many join attempts" }, 429, {
+          "Retry-After": String(
+            Math.ceil((JOIN_RATE_WINDOW_MS - (now - current.windowStartedAt)) / 1000),
+          ),
+        })
+      }
+      current.count += 1
+    } else {
+      rateLimits[ip] = { count: 1, windowStartedAt: now }
+    }
+
+    state.rateLimits = rateLimits
+    await this.saveState(state)
+    return null
   }
 
   private async handlePoll(game: string, ticket: string): Promise<Response> {
@@ -356,6 +432,20 @@ function buildWsUrl(requestUrl: string, roomId: string): string {
   const u = new URL(`/room/${roomId}`, requestUrl)
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:"
   return u.toString()
+}
+
+function isValidTicket(value: string): boolean {
+  return /^[a-z0-9]+-[a-f0-9]{8}$/i.test(value)
+}
+
+async function parseJson(
+  request: Request,
+): Promise<{ ok: true; value: unknown } | { ok: false; response: Response }> {
+  try {
+    return { ok: true, value: await request.json() }
+  } catch {
+    return { ok: false, response: jsonResponse({ error: "invalid json" }, 400) }
+  }
 }
 
 function generateTicket(): string {
