@@ -208,9 +208,13 @@ export class MatchmakingQueues extends DurableObject {
 
     // Guard: one active queue entry per peerId. If the same player re-joins
     // (e.g. lost their ticket and retried), return their existing waiting
-    // ticket instead of creating a duplicate queue entry.
+    // ticket instead of creating a duplicate queue entry. Refresh joinedAt
+    // so the 30s queue timeout resets on each rejoin attempt.
     const existingEntry = queue.find((p) => p.peerId === player.peerId)
     if (existingEntry) {
+      existingEntry.joinedAt = now
+      state.queues[game] = queue
+      await this.saveState(state)
       logEvent("warn", "duplicate_join_returned_existing", {
         game,
         peerId: player.peerId,
@@ -294,10 +298,21 @@ export class MatchmakingQueues extends DurableObject {
       return jsonResponse({ status: "matched", match })
     }
 
-    const queue = await this.getQueue(game)
+    const now = Date.now()
+    const state = await this.loadState()
+    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
     const player = queue.find((p) => p.ticket === ticket)
     if (!player) {
       return jsonResponse({ error: "ticket not found" }, 404)
+    }
+
+    // Refresh joinedAt on each poll so actively-polling players don't
+    // time out. The 30s queue timeout is for cleaning up abandoned
+    // entries, not for limiting how long someone can wait for a match.
+    if (now - player.joinedAt > QUEUE_TIMEOUT_MS / 2) {
+      player.joinedAt = now
+      state.queues[game] = queue
+      await this.saveState(state)
     }
 
     return jsonResponse({ status: "waiting", ticket, roomId: player.roomId })
