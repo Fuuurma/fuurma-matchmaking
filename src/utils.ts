@@ -16,6 +16,27 @@ export const MAX_PEER_ID_LENGTH = 128
 export const MAX_GUEST_ID_LENGTH = 64
 
 /**
+ * Max UTF-8 byte length for a raw `displayName` payload before sanitization.
+ *
+ * The validation contract calls out "UTF-8 byte bounds" so we measure the
+ * UTF-8 byte length of the inbound string rather than `.length` (UTF-16
+ * code units). A 100-emoji name is 200 chars / 400 bytes; without this
+ * check, `.length`-only validation accepts up to ~1024 bytes per 4-byte
+ * glyph before tripping, which is far beyond the 256-char-after-slice
+ * limit and lets crafted payloads inflate stored names. Enforcing an
+ * explicit UTF-8 ceiling also keeps the join body well under the 1 MiB
+ * Worker request body limit. Identity fields (`peerId` / `guestId`)
+ * remain capped on `.length` because they are opaque client IDs, not
+ * user-rendered strings.
+ */
+export const MAX_DISPLAY_NAME_UTF8_BYTES = 256
+
+/** Measure a string's UTF-8 byte length using the platform TextEncoder. */
+export function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length
+}
+
+/**
  * Sanitize a user-supplied display name for safe storage and relay.
  *
  * Strips control characters and HTML-special characters that could cause

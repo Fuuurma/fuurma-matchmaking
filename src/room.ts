@@ -3,6 +3,7 @@ import {
   ALLOWED_GAMES,
   jsonResponse,
   logEvent,
+  MAX_GUEST_ID_LENGTH,
   MAX_MESSAGE_BYTES,
   sanitizeDisplayName,
 } from "./utils"
@@ -240,8 +241,12 @@ export class GameRoomDO extends DurableObject {
     ws: WebSocket,
     msg: { guestId: string; displayName?: string; role?: unknown },
   ): Promise<void> {
-    if (typeof msg.guestId !== "string" || msg.guestId.length < 1 || msg.guestId.length > 64) {
-      this.sendError(ws, "invalid", "guestId required (1-64 chars)")
+    if (
+      typeof msg.guestId !== "string" ||
+      msg.guestId.length < 1 ||
+      msg.guestId.length > MAX_GUEST_ID_LENGTH
+    ) {
+      this.sendError(ws, "invalid", `guestId required (1-${MAX_GUEST_ID_LENGTH} chars)`)
       ws.close(1008, "invalid hello")
       return
     }

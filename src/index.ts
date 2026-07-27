@@ -5,9 +5,11 @@ import {
   corsHeaders,
   jsonResponse,
   logEvent,
+  MAX_DISPLAY_NAME_UTF8_BYTES,
   MAX_GUEST_ID_LENGTH,
   MAX_PEER_ID_LENGTH,
   sanitizeDisplayName,
+  utf8ByteLength,
 } from "./utils"
 
 export { GameRoomDO }
@@ -174,11 +176,23 @@ export class MatchmakingQueues extends DurableObject {
     ) {
       return jsonResponse({ error: `guestId must be 1-${MAX_GUEST_ID_LENGTH} chars` }, 400)
     }
-    if (
-      req.displayName !== undefined &&
-      (typeof req.displayName !== "string" || req.displayName.length > 256)
-    ) {
-      return jsonResponse({ error: "displayName must be at most 256 chars" }, 400)
+    if (req.displayName !== undefined) {
+      if (typeof req.displayName !== "string") {
+        return jsonResponse({ error: "displayName must be a string" }, 400)
+      }
+      // Bound the raw payload by UTF-8 byte length (per the validation
+      // contract). This prevents a malicious client from submitting a
+      // name whose `.length` (UTF-16 code units) is small but whose
+      // UTF-8 byte count is large (e.g. 100 emoji = 200 .length /
+      // 400 bytes). The same `.length`-only check used for opaque IDs
+      // would accept up to ~1024 bytes per 4-byte glyph before tripping,
+      // letting crafted payloads inflate stored names.
+      if (utf8ByteLength(req.displayName) > MAX_DISPLAY_NAME_UTF8_BYTES) {
+        return jsonResponse(
+          { error: `displayName must be at most ${MAX_DISPLAY_NAME_UTF8_BYTES} UTF-8 bytes` },
+          400,
+        )
+      }
     }
 
     const now = Date.now()

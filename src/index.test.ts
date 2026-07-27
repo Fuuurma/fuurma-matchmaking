@@ -235,4 +235,93 @@ describe("MatchmakingQueues via worker fetch", () => {
 
     await leave("tictactoe", hostBody.ticket)
   })
+
+  it("rejects displayName whose UTF-8 byte length exceeds 256 bytes (emoji blow-up)", async () => {
+    // 🎉 is 4 UTF-8 bytes / 2 UTF-16 code units. 100 emoji = 200 .length
+    // / 400 bytes — well over the 256-byte UTF-8 cap, must be rejected.
+    const emoji = "🎉".repeat(100)
+    expect(emoji.length).toBe(200)
+    expect(new TextEncoder().encode(emoji).length).toBe(400)
+
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", {
+        method: "POST",
+        body: JSON.stringify({
+          peerId: "peer-emoji",
+          guestId: "g-emoji",
+          displayName: emoji,
+        }),
+        headers: { "Content-Type": "application/json" },
+      }),
+      env,
+    )
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).toMatch(/UTF-8 bytes/i)
+  })
+
+  it("accepts a displayName within both length and UTF-8 byte bounds", async () => {
+    // 30 ASCII chars = 30 bytes / 30 .length — well under both caps.
+    const response = await join("tictactoe", "peer-utf8-ok", "g-utf8-ok", "X".repeat(30))
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { status: string; ticket: string }
+    expect(body.status).toBe("waiting")
+    await leave("tictactoe", body.ticket)
+  })
+
+  it("rejects a peerId exceeding the .length cap (opaque ID, not a renderable name)", async () => {
+    // peerId is capped on .length (UTF-16 code units) only — it's an opaque
+    // identifier from the client, never rendered to peers.
+    const longPeer = "p".repeat(129)
+    const response = await join("tictactoe", longPeer, "g-bytelen", "OK")
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).toMatch(/peerId required/i)
+  })
+
+  it("accepts a peerId exactly at the .length cap", async () => {
+    const atLimit = "p".repeat(128)
+    const response = await join("tictactoe", atLimit, "g-atlimit", "OK")
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { status: string; ticket: string }
+    expect(body.status).toBe("waiting")
+    await leave("tictactoe", body.ticket)
+  })
+
+  it("rejects unknown game routes with 400 and never reaches a Durable Object", async () => {
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/unknown/join", {
+        method: "POST",
+        body: JSON.stringify({ peerId: "p", guestId: "g" }),
+        headers: { "Content-Type": "application/json" },
+      }),
+      env,
+    )
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).toBe("unknown game")
+  })
+
+  it("returns 404 for unknown matchmaking sub-paths", async () => {
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/bogus", { method: "GET" }),
+      env,
+    )
+    expect(response.status).toBe(404)
+  })
+
+  it("returns 404 for malformed top-level paths", async () => {
+    const response = await worker.fetch(new Request("https://test.invalid/nope"), env)
+    expect(response.status).toBe(404)
+  })
+
+  it("returns 400 for invalid room id formats", async () => {
+    for (const bad of ["", "abc", "x".repeat(20), "a-b-c"]) {
+      const response = await worker.fetch(
+        new Request(`https://test.invalid/room/${bad}?game=tictactoe`),
+        env,
+      )
+      expect(response.status).toBe(400)
+    }
+  })
 })

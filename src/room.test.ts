@@ -329,4 +329,67 @@ describe("GameRoomDO", () => {
     host.close()
     guest.close()
   })
+
+  it("rejects hello with guestId exceeding the .length cap", async () => {
+    // guestId is capped on .length (UTF-16 code units) only — opaque ID.
+    const ws = await openSocket(roomId("utf8gb"))
+    send(ws, { type: "hello", guestId: "g".repeat(65), displayName: "X" })
+    const parsed = JSON.parse(await nextMessage(ws))
+    expect(parsed.type).toBe("error")
+    expect(parsed.code).toBe("invalid")
+    expect(parsed.message).toMatch(/guestId/i)
+    ws.close()
+  })
+
+  it("accepts hello with a guestId exactly at the .length cap", async () => {
+    const ws = await openSocket(roomId("utf8gb-ok"))
+    send(ws, { type: "hello", guestId: "g".repeat(64), displayName: "X" })
+    const welcome = JSON.parse(await nextMessage(ws))
+    expect(welcome.type).toBe("welcome")
+    expect(welcome.role).toBe("host")
+    ws.close()
+  })
+
+  it("returns 400 for an unknown game in the WebSocket upgrade", async () => {
+    const id = env.GAME_ROOM.idFromName(roomId("badschema"))
+    const stub = env.GAME_ROOM.get(id)
+    const resp = await stub.fetch(
+      new Request("https://test.invalid/?game=crown-chess", {
+        headers: { Upgrade: "websocket" },
+      }),
+    )
+    expect(resp.status).toBe(400)
+    const body = (await resp.json()) as { error: string }
+    expect(body.error).toBe("unknown game")
+  })
+
+  it("broadcasts peer-left only to live sockets after the alarm expires", async () => {
+    const rid = roomId("alarmon")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h2", displayName: "H2" })
+    await nextMessage(host)
+
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.put("room-state", {
+        game: "tictactoe",
+        slots: [
+          { guestId: "h2", displayName: "H2", role: "host", disconnectedAt: null },
+          { guestId: "g2", displayName: "G2", role: "guest", disconnectedAt: Date.now() - 60_000 },
+        ],
+      }),
+    )
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.setAlarm(Date.now() + 30_000),
+    )
+    const expiredMessage = nextMessage(host, 1000, "expired only-once")
+    await runDurableObjectAlarm(stub)
+    const evt = JSON.parse(await expiredMessage)
+    expect(evt.type).toBe("peer-left")
+    expect(evt.reason).toBe("expired")
+    // Running the alarm a second time must NOT re-broadcast (no slots left).
+    const second = await runDurableObjectAlarm(stub)
+    expect(second).toBe(false)
+    host.close()
+  })
 })
