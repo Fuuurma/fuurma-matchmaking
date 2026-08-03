@@ -22,7 +22,7 @@ import {
  * role. After the grace expires, an `alarm` cleans up the orphan slot and
  * notifies the remaining peer via `peer-left` with reason `expired`.
  *
- * Spec: ../../newProjectsPlanner/migrations/2026-07-games-do-websocket-migration.md
+ * Spec: ../../hub/migrations/2026-07-games-do-websocket-migration.md
  */
 
 const RECONNECT_GRACE_MS = 30_000
