@@ -14,6 +14,11 @@ export const MAX_DISPLAY_NAME_LENGTH = 20
 /** Bounds for matchmaking identity fields accepted from browsers. */
 export const MAX_PEER_ID_LENGTH = 128
 export const MAX_GUEST_ID_LENGTH = 64
+export const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/
+
+export function isValidRoomId(value: string): boolean {
+  return ROOM_ID_PATTERN.test(value)
+}
 
 /**
  * Max UTF-8 byte length for a raw `displayName` payload before sanitization.

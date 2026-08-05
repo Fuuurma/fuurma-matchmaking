@@ -3,6 +3,7 @@ import { GameRoomDO } from "./room"
 import {
   ALLOWED_GAMES,
   corsHeaders,
+  isValidRoomId,
   jsonResponse,
   logEvent,
   MAX_DISPLAY_NAME_UTF8_BYTES,
@@ -392,7 +393,7 @@ export default {
     // WebSocket relay route: /room/{roomId}
     if (request.method === "GET" && url.pathname.startsWith("/room/")) {
       const roomId = url.pathname.slice("/room/".length)
-      if (!/^[A-Za-z0-9]{4,16}$/.test(roomId)) {
+      if (!isValidRoomId(roomId)) {
         return jsonResponse({ error: "invalid room id" }, 400)
       }
       const id = env.GAME_ROOM.idFromName(roomId)

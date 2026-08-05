@@ -316,12 +316,22 @@ describe("MatchmakingQueues via worker fetch", () => {
   })
 
   it("returns 400 for invalid room id formats", async () => {
-    for (const bad of ["", "abc", "x".repeat(20), "a-b-c"]) {
+    for (const bad of ["", "abc", "x".repeat(65), "a.b-c"]) {
       const response = await worker.fetch(
         new Request(`https://test.invalid/room/${bad}?game=tictactoe`),
         env,
       )
       expect(response.status).toBe(400)
+    }
+  })
+
+  it("accepts the full client room-id contract before WebSocket validation", async () => {
+    for (const roomId of ["a1_b", "x".repeat(64)]) {
+      const response = await worker.fetch(
+        new Request(`https://test.invalid/room/${roomId}?game=tictactoe`),
+        env,
+      )
+      expect(response.status).toBe(426)
     }
   })
 })

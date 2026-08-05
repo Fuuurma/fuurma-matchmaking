@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 function roomId(seed: string): string {
   return `T${seed.padEnd(11, "0").slice(0, 11)}` // "T" + 11 chars = 12 chars total
@@ -107,15 +107,46 @@ describe("GameRoomDO", () => {
     await nextMessage(guest)
     await nextMessage(host) // peer-joined
 
-    const third = await openSocket(rid)
-    send(third, { type: "hello", guestId: "g3", displayName: "Third" })
-    const err = JSON.parse(await nextMessage(third))
-    expect(err.type).toBe("error")
-    expect(err.code).toBe("unknown")
+    const thirdResponse = await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid)).fetch(
+      new Request("https://test.invalid/?game=tictactoe", {
+        headers: { Upgrade: "websocket" },
+      }),
+    )
+    expect(thirdResponse.status).toBe(429)
 
     host.close()
     guest.close()
-    third.close()
+  })
+
+  it("rejects a third WebSocket upgrade before hello", async () => {
+    const rid = roomId("thirdpend")
+    const first = await openSocket(rid)
+    const second = await openSocket(rid)
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    const response = await stub.fetch(
+      new Request("https://test.invalid/?game=tictactoe", {
+        headers: { Upgrade: "websocket" },
+      }),
+    )
+    expect(response.status).toBe(429)
+    expect(response.headers.get("Retry-After")).toBe("10")
+
+    first.close()
+    second.close()
+  })
+
+  it("closes a socket that never completes hello", async () => {
+    const now = Date.now()
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now)
+    const rid = roomId("hellotime")
+    const ws = await openSocket(rid)
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    nowSpy.mockReturnValue(now + 10_001)
+    expect(await runDurableObjectAlarm(stub)).toBe(true)
+    expect(ws.readyState).toBe(WebSocket.CLOSED)
+    nowSpy.mockRestore()
   })
 
   it("rejects reusing a room for another game", async () => {
