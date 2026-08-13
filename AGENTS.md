@@ -29,6 +29,8 @@ Operational rules:
 ### Agent skills and generated guidance
 
 When one of these global skills matches your work, **invoke it immediately** at the start of the session:
+- `design-arsenal` — UI/UX, visual polish, landing pages, design direction. Front door: `~/Projects/hub/design/README.md`.
+- `design-taste-frontend` / `hallmark` / `impeccable` — anti-slop design quality on every UI pass.
 - `shadcn` — adding, fixing, or reviewing shadcn/ui components and Tailwind v4 styling.
 - `convex` — routing Convex work to the right helper skill (quickstart, auth, components, migrations, performance audit).
 - `stripe-best-practices` — checkout, billing, subscriptions, webhooks, Connect, key handling.
@@ -38,7 +40,9 @@ When one of these global skills matches your work, **invoke it immediately** at 
 
 For Convex repos, run `npx convex ai-files install` first if `convex/_generated/ai/guidelines.md` is missing or stale.
 
-For UI work, use `pnpm dlx shadcn@latest` and follow the `shadcn` skill rules (no `space-x/y`, use `gap-*`, `size-*`, `cn()`, semantic tokens, lucide icons, `FieldGroup`/`Field`, etc.).
+For UI/UX, landing, visual polish, or any screen users see: invoke `design-arsenal` first, then `design-taste-frontend`, `hallmark`, and `impeccable`. Read `~/Projects/hub/design/README.md`. Pull `tools.md` or `inspiration.md` only as needed. A repo `DESIGN.md` wins when it exists.
+
+For UI implementation, use `pnpm dlx shadcn@latest` and follow the `shadcn` skill rules (no `space-x/y`, use `gap-*`, `size-*`, `cn()`, semantic tokens, lucide icons, `FieldGroup`/`Field`, etc.).
 
 For TanStack Start/Router/Form, there is no global skill; follow `STACK-STANDARDS.md`, `CONVENTIONS.md`, and `TANSTACK-FORM.md`. Use TanStack Form for every new form and every touched legacy form.
 

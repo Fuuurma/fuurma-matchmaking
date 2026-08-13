@@ -63,6 +63,7 @@ export function corsHeaders(): Record<string, string> {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
   }
 }
 

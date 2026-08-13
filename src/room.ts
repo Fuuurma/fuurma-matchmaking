@@ -76,6 +76,13 @@ const isPendingConnection = (
 const ROOM_STATE_KEY = "room-state"
 
 export class GameRoomDO extends DurableObject {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env)
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair("ping", JSON.stringify({ type: "pong" })),
+    )
+  }
+
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade", {

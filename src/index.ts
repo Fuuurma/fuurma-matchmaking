@@ -232,8 +232,7 @@ export class MatchmakingQueues extends DurableObject {
       await this.saveState(state)
       logEvent("warn", "duplicate_join_returned_existing", {
         game,
-        peerId: player.peerId,
-        ticket: existingEntry.ticket,
+        peerId: player.peerId.slice(0, 8),
       })
       return jsonResponse({
         status: "waiting",

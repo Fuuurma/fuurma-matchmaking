@@ -127,11 +127,20 @@ cross-game room access.
 
 ```bash
 pnpm install
+pnpm exec wrangler types --check
+pnpm run check
+pnpm run lint
+pnpm run test
 pnpm run deploy:check
 pnpm run deploy
 ```
 
 Preview URL: `https://fuurma-matchmaking.sergiformatjer1999.workers.dev`
+
+Pull requests and pushes to `main` run the same type-generation, type-check,
+lint, test, and deployment-preflight gates in GitHub Actions. Use
+`pnpm exec wrangler check startup` locally when changing startup imports; the
+command is currently alpha and writes a CPU profile artifact.
 
 ## Env
 
