@@ -8,7 +8,7 @@ ports, deploy/auth notes, and agent handoffs.
 Before meaningful work, read:
 1. Current sprint / next work: `~/Projects/hub/WORK.md`
 2. This project's state page: `~/Projects/hub/projects/fuurma-matchmaking.md`
-3. Standard stack playbook: `~/Projects/hub/tech-stack/STACK-STANDARDS.md`
+3. Standard stack playbook: `~/Projects/hub/tech-stack/CONVENTIONS.md`
 4. Agent skills/context: `~/Projects/hub/tech-stack/AGENT-CONTEXT.md`
 5. Official docs index: `~/Projects/hub/tech-stack/OFFICIAL-DOCS.md`
 
