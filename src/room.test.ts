@@ -464,6 +464,38 @@ describe("GameRoomDO", () => {
     ws.close()
   })
 
+  it("rejects multibyte frames over the byte cap even when .length is small (MM-04)", async () => {
+    const ws = await openSocket(roomId("biguni"))
+    send(ws, { type: "hello", guestId: "big", displayName: "B" })
+    await nextMessage(ws)
+    // 25k × U+20AC: .length ~25k (under the old check) but 75k UTF-8 bytes.
+    const oversized = { type: "move", payload: "€".repeat(25_000) }
+    ws.send(JSON.stringify(oversized))
+    const raw = JSON.parse(await nextMessage(ws))
+    expect(raw.type).toBe("error")
+    expect(raw.code).toBe("invalid")
+    expect(raw.message).toMatch(/too large/i)
+    ws.close()
+  })
+
+  it("accepts a multibyte frame of exactly MAX_MESSAGE_BYTES (MM-04)", async () => {
+    const host = await openSocket(roomId("exactuni"))
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    const guest = await openSocket(roomId("exactuni"))
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+    // JSON overhead is 28 ASCII bytes; "é" is 2 bytes: 28 + 2*32754 = 65536.
+    const frame = JSON.stringify({ type: "move", payload: "é".repeat(32_754) })
+    expect(new TextEncoder().encode(frame).length).toBe(64 * 1024)
+    host.send(frame)
+    const relayed = JSON.parse(await nextMessage(guest))
+    expect(relayed.type).toBe("move")
+    host.close()
+    guest.close()
+  })
+
   it("rejects relay from sockets that have not sent hello", async () => {
     const ws = await openSocket(roomId("nohello2"))
     // Send a game message before hello — should be rejected.
