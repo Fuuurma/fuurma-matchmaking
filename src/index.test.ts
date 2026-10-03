@@ -144,7 +144,7 @@ describe("MatchmakingQueues via worker fetch", () => {
     const hostBody = (await host.json()) as { status: "waiting"; ticket: string; roomId: string }
     expect(hostBody.status).toBe("waiting")
     expect(hostBody.ticket).toBeTruthy()
-    expect(hostBody.roomId).toMatch(/^[A-Z0-9]{8}$/)
+    expect(hostBody.roomId).toMatch(/^[A-Z0-9]{32}$/)
 
     const guest = await join("tictactoe", "peer-2", "g2", "Bob")
     expect(guest.status).toBe(200)

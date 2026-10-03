@@ -50,6 +50,20 @@ interface Slot {
   displayName: string
   role: "host" | "guest"
   disconnectedAt: number | null
+  /**
+   * Private per-player reconnect credential (MM-01). Minted when the slot is
+   * created, returned only in that socket's `welcome`, and required to
+   * reclaim the slot after a disconnect. Never sent to the opponent.
+   * Slots persisted before MM-01 lack this field and get one backfilled on
+   * their next uncontested hello (see handleHello).
+   */
+  reconnectToken: string
+}
+
+/** 128 bits of randomness, hex-encoded — the per-slot reconnect credential. */
+function generateReconnectToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
 }
 
 interface RoomState {
@@ -303,7 +317,7 @@ export class GameRoomDO extends DurableObject {
 
   private async handleHello(
     ws: WebSocket,
-    msg: { guestId: string; displayName?: string; role?: unknown },
+    msg: { guestId: string; displayName?: string; role?: unknown; reconnectToken?: unknown },
   ): Promise<void> {
     const pending = ws.deserializeAttachment() as PendingConnectionAttachment | null
     if (pending?.pending !== true || Date.now() - pending.connectedAt > HELLO_TIMEOUT_MS) {
@@ -343,6 +357,26 @@ export class GameRoomDO extends DurableObject {
         ws.close(1013, "duplicate connection")
         return
       }
+      // Reclaim requires the private credential minted at slot creation
+      // (MM-01): the public guestId alone must not reattach a disconnected
+      // slot, because the opponent learns it from welcome/peer-joined.
+      const presented =
+        typeof msg.reconnectToken === "string" ? msg.reconnectToken : null
+      if (typeof msg.reconnectToken !== "undefined" && presented === null) {
+        this.sendError(ws, "invalid", "reconnectToken must be a string")
+        ws.close(1008, "invalid hello")
+        return
+      }
+      if (!existing.reconnectToken) {
+        // Legacy slot persisted before MM-01: backfill on this uncontested
+        // hello (no active socket holds the identity) and require the
+        // credential from now on.
+        existing.reconnectToken = generateReconnectToken()
+      } else if (presented !== existing.reconnectToken) {
+        this.sendError(ws, "invalid", "reconnect credential required")
+        ws.close(1008, "reconnect rejected")
+        return
+      }
       existing.disconnectedAt = null
       existing.displayName = displayName
       slot = existing
@@ -368,7 +402,13 @@ export class GameRoomDO extends DurableObject {
         return
       }
 
-      slot = { guestId: msg.guestId, displayName, role, disconnectedAt: null }
+      slot = {
+        guestId: msg.guestId,
+        displayName,
+        role,
+        disconnectedAt: null,
+        reconnectToken: generateReconnectToken(),
+      }
       state.slots.push(slot)
     }
 
@@ -387,6 +427,9 @@ export class GameRoomDO extends DurableObject {
       JSON.stringify({
         type: "welcome",
         role: slot.role,
+        // Self-only: the private reclaim credential. Peer-joined /
+        // peer-reconnected broadcasts deliberately omit it (MM-01).
+        reconnectToken: slot.reconnectToken,
         opponent: opponent
           ? { guestId: opponent.guestId, displayName: opponent.displayName }
           : null,

@@ -521,5 +521,11 @@ function generateTicket(): string {
 }
 
 function generateRoomId(): string {
-  return crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()
+  // 128-bit room locator (MM-01): the old 8-hex-char id held 32 random bits.
+  // 32 chars stays inside the 4-64 client room-id contract.
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return [...bytes]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()
 }
