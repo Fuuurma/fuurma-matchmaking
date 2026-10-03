@@ -57,6 +57,63 @@ describe("MatchmakingQueues via worker fetch", () => {
     expect(oversizedGuest.status).toBe(400)
   })
 
+  it("rejects declared-oversize join bodies with 413 (MM-03)", async () => {
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", {
+        method: "POST",
+        body: JSON.stringify({ peerId: "p", junk: "x".repeat(10 * 1024) }),
+        headers: { "Content-Type": "application/json" },
+      }),
+      env,
+    )
+    expect(response.status).toBe(413)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).toMatch(/too large/i)
+  })
+
+  it("stops chunked oversize bodies at the limit without buffering all (MM-03)", async () => {
+    let pulls = 0
+    const chunk = new TextEncoder().encode("y".repeat(1024))
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++
+        if (pulls <= 20) controller.enqueue(chunk)
+        else controller.close()
+      },
+    })
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", {
+        method: "POST",
+        body: stream,
+        headers: { "Content-Type": "application/json" },
+        duplex: "half",
+      } as RequestInit),
+      env,
+    )
+    expect(response.status).toBe(413)
+    // 8 KiB cap / 1 KiB chunks: must stop after ~9 pulls, not all 20.
+    expect(pulls).toBeLessThan(20)
+    expect(pulls).toBeGreaterThan(0)
+  })
+
+  it("accepts a join body of exactly MAX_JSON_BODY_BYTES (MM-03)", async () => {
+    const base = JSON.stringify({ peerId: "p-exact", junk: "" })
+    const pad = 8 * 1024 - base.length
+    expect(pad).toBeGreaterThan(0)
+    const body = JSON.stringify({ peerId: "p-exact", junk: "x".repeat(pad) })
+    expect(new TextEncoder().encode(body).length).toBe(8 * 1024)
+    const response = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", {
+        method: "POST",
+        body,
+        headers: { "Content-Type": "application/json" },
+      }),
+      env,
+    )
+    expect(response.status).toBe(200)
+    await leave("tictactoe", ((await response.json()) as { ticket: string }).ticket)
+  })
+
   it("throttles repeated joins from the same client address", async () => {
     const headers = {
       "Content-Type": "application/json",

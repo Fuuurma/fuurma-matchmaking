@@ -8,6 +8,14 @@ export const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
 /** Max WebSocket message size (64 KiB — generous for turn-based game moves). */
 export const MAX_MESSAGE_BYTES = 64 * 1024
 
+/**
+ * Max JSON request body for join/leave (8 KiB — legitimate payloads are
+ * under 1 KiB: peerId ≤128 chars, guestId ≤64, displayName ≤256 bytes).
+ * Enforced on declared Content-Length AND on streamed bytes so a missing
+ * or false length header cannot bypass it (MM-03).
+ */
+export const MAX_JSON_BODY_BYTES = 8 * 1024
+
 /** Max length of a display name after sanitization. */
 export const MAX_DISPLAY_NAME_LENGTH = 20
 
