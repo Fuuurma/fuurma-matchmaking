@@ -8,6 +8,7 @@ import {
   logEvent,
   MAX_DISPLAY_NAME_UTF8_BYTES,
   MAX_GUEST_ID_LENGTH,
+  MAX_JSON_BODY_BYTES,
   MAX_PEER_ID_LENGTH,
   sanitizeDisplayName,
   utf8ByteLength,
@@ -473,8 +474,39 @@ function isValidTicket(value: string): boolean {
 async function parseJson(
   request: Request,
 ): Promise<{ ok: true; value: unknown } | { ok: false; response: Response }> {
+  const tooLarge = () => jsonResponse({ error: "request body too large" }, 413)
+  // Declared-length fast path: reject without reading a byte. An absent or
+  // unparseable length falls through to stream enforcement below.
+  const declared = request.headers.get("content-length")
+  if (declared != null && /^\d+$/.test(declared.trim()) && Number(declared) > MAX_JSON_BODY_BYTES) {
+    return { ok: false, response: tooLarge() }
+  }
+  // Stream-enforced read: a false small (or missing) Content-Length cannot
+  // bypass the cap. Stops at the limit instead of buffering the full body.
   try {
-    return { ok: true, value: await request.json() }
+    const body = request.body
+    if (!body) return { ok: false, response: jsonResponse({ error: "invalid json" }, 400) }
+    const reader = body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value?.byteLength ?? 0
+      if (total > MAX_JSON_BODY_BYTES) {
+        await reader.cancel().catch(() => {})
+        return { ok: false, response: tooLarge() }
+      }
+      if (value) chunks.push(value)
+    }
+    const merged = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      merged.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    const text = new TextDecoder().decode(merged)
+    return { ok: true, value: JSON.parse(text) }
   } catch {
     return { ok: false, response: jsonResponse({ error: "invalid json" }, 400) }
   }
