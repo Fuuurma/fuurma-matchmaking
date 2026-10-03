@@ -190,6 +190,38 @@ describe("MatchmakingQueues via worker fetch", () => {
     expect(pollHost.status).toBe(404)
   })
 
+  it("issues opaque 128-bit tickets unique per join (MM-02)", async () => {
+    const first = await join("tictactoe", "peer-t1", "gt1", "Alice")
+    const firstBody = (await first.json()) as { status: "waiting"; ticket: string }
+    expect(firstBody.ticket).toMatch(/^[0-9a-f]{32}$/)
+
+    const second = await join("tictactoe", "peer-t2", "gt2", "Bob")
+    const secondBody = (await second.json()) as {
+      status: "matched" | "waiting"
+      ticket?: string
+    }
+    // Second join matched the first; rejoin after leaving to get a new ticket.
+    await leave("tictactoe", firstBody.ticket)
+    const third = await join("tictactoe", "peer-t3", "gt3", "Cara")
+    const thirdBody = (await third.json()) as { status: "waiting"; ticket: string }
+    expect(thirdBody.ticket).toMatch(/^[0-9a-f]{32}$/)
+    expect(thirdBody.ticket).not.toBe(firstBody.ticket)
+    expect(secondBody.status).toBe("matched")
+    await leave("tictactoe", thirdBody.ticket)
+  })
+
+  it("poll and leave reject malformed tickets with 400 (MM-02)", async () => {
+    for (const bad of ["bogus", "abc-12345678", "0".repeat(31), "g".repeat(32)]) {
+      const pollResp = await poll("tictactoe", bad)
+      expect(pollResp.status).toBe(400)
+      const leaveResp = await leave("tictactoe", bad)
+      expect(leaveResp.status).toBe(400)
+    }
+    // Well-formed but unknown tickets still 404 on poll.
+    const unknown = await poll("tictactoe", "0".repeat(32))
+    expect(unknown.status).toBe(404)
+  })
+
   it("rejects unknown games", async () => {
     const response = await join("unochess", "peer-9", "g9", "Alice")
     expect(response.status).toBe(400)
