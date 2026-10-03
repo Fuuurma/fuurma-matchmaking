@@ -145,8 +145,7 @@ export class GameRoomDO extends DurableObject {
     // Reject oversized frames early to prevent memory abuse. String frames
     // are measured in UTF-8 bytes (MM-04): .length counts UTF-16 code units,
     // letting multibyte text exceed the documented wire-byte cap ~4x.
-    const byteLength =
-      typeof message === "string" ? utf8ByteLength(message) : message.byteLength
+    const byteLength = typeof message === "string" ? utf8ByteLength(message) : message.byteLength
     if (byteLength > MAX_MESSAGE_BYTES) {
       this.sendError(ws, "invalid", `message too large (max ${MAX_MESSAGE_BYTES} bytes)`)
       return
@@ -360,8 +359,7 @@ export class GameRoomDO extends DurableObject {
       // Reclaim requires the private credential minted at slot creation
       // (MM-01): the public guestId alone must not reattach a disconnected
       // slot, because the opponent learns it from welcome/peer-joined.
-      const presented =
-        typeof msg.reconnectToken === "string" ? msg.reconnectToken : null
+      const presented = typeof msg.reconnectToken === "string" ? msg.reconnectToken : null
       if (typeof msg.reconnectToken !== "undefined" && presented === null) {
         this.sendError(ws, "invalid", "reconnectToken must be a string")
         ws.close(1008, "invalid hello")
