@@ -94,6 +94,9 @@ export class MatchmakingQueues extends DurableObject {
       if (request.method === "GET" && action === "poll") {
         const ticket = url.searchParams.get("ticket")
         if (!ticket) return jsonResponse({ error: "ticket required" }, 400)
+        if (!isValidTicket(ticket)) {
+          return jsonResponse({ error: "valid ticket required" }, 400)
+        }
         return this.handlePoll(game, ticket)
       }
 
@@ -464,7 +467,7 @@ function buildWsUrl(requestUrl: string, roomId: string): string {
 }
 
 function isValidTicket(value: string): boolean {
-  return /^[a-z0-9]+-[a-f0-9]{8}$/i.test(value)
+  return /^[0-9a-f]{32}$/.test(value)
 }
 
 async function parseJson(
@@ -478,7 +481,11 @@ async function parseJson(
 }
 
 function generateTicket(): string {
-  return `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+  // 128 bits of cryptographic randomness (MM-02): the old timestamp +
+  // 8-hex-char suffix left only 32 unpredictable bits on a Bearer [REDACTED] used
+  // by poll/leave. Clients treat tickets as opaque strings.
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
 }
 
 function generateRoomId(): string {
