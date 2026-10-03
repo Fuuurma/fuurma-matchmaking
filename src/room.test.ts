@@ -190,14 +190,122 @@ describe("GameRoomDO", () => {
     send(first, { type: "hello", guestId: "stable-id", displayName: "Stable" })
     const w1 = JSON.parse(await nextMessage(first))
     expect(w1.role).toBe("host")
+    expect(w1.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
     first.close()
 
     const second = await openSocket(rid)
-    send(second, { type: "hello", guestId: "stable-id", displayName: "Stable" })
+    send(second, {
+      type: "hello",
+      guestId: "stable-id",
+      displayName: "Stable",
+      reconnectToken: w1.reconnectToken,
+    })
     const w2 = JSON.parse(await nextMessage(second))
     expect(w2.role).toBe("host")
     expect(w2.opponent).toBeNull()
+    expect(w2.reconnectToken).toBe(w1.reconnectToken)
     second.close()
+  })
+
+  it("rejects slot reclaim with the public guestId alone (MM-01)", async () => {
+    const rid = roomId("reclaim")
+    const victim = await openSocket(rid)
+    send(victim, { type: "hello", guestId: "victim", displayName: "V" })
+    const welcome = JSON.parse(await nextMessage(victim))
+    expect(welcome.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
+    victim.close()
+
+    // Attacker knows roomId + victim guestId (both public) but no credential.
+    const attacker = await openSocket(rid)
+    send(attacker, { type: "hello", guestId: "victim", displayName: "Evil" })
+    const err = JSON.parse(await nextMessage(attacker))
+    expect(err.type).toBe("error")
+    expect(err.message).toMatch(/reconnect credential required/i)
+    attacker.close()
+
+    // Wrong credential is rejected the same way.
+    const attacker2 = await openSocket(rid)
+    send(attacker2, {
+      type: "hello",
+      guestId: "victim",
+      displayName: "Evil",
+      reconnectToken: "0".repeat(32),
+    })
+    const err2 = JSON.parse(await nextMessage(attacker2))
+    expect(err2.type).toBe("error")
+    expect(err2.message).toMatch(/reconnect credential required/i)
+    attacker2.close()
+
+    // The legitimate holder reclaims the slot afterwards.
+    const legit = await openSocket(rid)
+    send(legit, {
+      type: "hello",
+      guestId: "victim",
+      displayName: "V",
+      reconnectToken: welcome.reconnectToken,
+    })
+    const w2 = JSON.parse(await nextMessage(legit))
+    expect(w2.type).toBe("welcome")
+    expect(w2.role).toBe("host")
+    legit.close()
+  })
+
+  it("never forwards the credential to the opponent (MM-01)", async () => {
+    const rid = roomId("noleak")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    const hostWelcome = JSON.parse(await nextMessage(host))
+    expect(hostWelcome.reconnectToken).toBeDefined()
+
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    const guestWelcome = JSON.parse(await nextMessage(guest))
+    expect(guestWelcome.reconnectToken).toBeDefined()
+    expect(guestWelcome.reconnectToken).not.toBe(hostWelcome.reconnectToken)
+
+    const joined = JSON.parse(await nextMessage(host))
+    expect(joined.type).toBe("peer-joined")
+    expect(JSON.stringify(joined)).not.toContain("reconnectToken")
+
+    guest.close()
+    await nextMessage(host) // peer-left
+    const re = await openSocket(rid)
+    send(re, {
+      type: "hello",
+      guestId: "g",
+      displayName: "G",
+      reconnectToken: guestWelcome.reconnectToken,
+    })
+    await nextMessage(re) // welcome
+    const reconnected = JSON.parse(await nextMessage(host))
+    expect(reconnected.type).toBe("peer-reconnected")
+    expect(JSON.stringify(reconnected)).not.toContain("reconnectToken")
+    host.close()
+    re.close()
+  })
+
+  it("backfills a credential for pre-MM-01 slots on uncontested hello (MM-01)", async () => {
+    const rid = roomId("legacy")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.put("room-state", {
+        game: "tictactoe",
+        slots: [{ guestId: "old", displayName: "O", role: "host", disconnectedAt: 1 }],
+      }),
+    )
+    const ws = await openSocket(rid)
+    send(ws, { type: "hello", guestId: "old", displayName: "O" })
+    const welcome = JSON.parse(await nextMessage(ws))
+    expect(welcome.type).toBe("welcome")
+    expect(welcome.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
+    ws.close()
+
+    // From now on the credential is required.
+    const ws2 = await openSocket(rid)
+    send(ws2, { type: "hello", guestId: "old", displayName: "O" })
+    const err = JSON.parse(await nextMessage(ws2))
+    expect(err.type).toBe("error")
+    ws2.close()
   })
 
   it("rejects duplicate guestId while a live socket exists", async () => {
@@ -238,7 +346,7 @@ describe("GameRoomDO", () => {
     send(host, { type: "hello", guestId: "h", displayName: "H" })
     await nextMessage(host)
     send(guest, { type: "hello", guestId: "g", displayName: "G" })
-    await nextMessage(guest)
+    const guestWelcome = JSON.parse(await nextMessage(guest))
     await nextMessage(host)
 
     guest.close()
@@ -248,7 +356,12 @@ describe("GameRoomDO", () => {
     })
 
     const reconnected = await openSocket(rid)
-    send(reconnected, { type: "hello", guestId: "g", displayName: "G" })
+    send(reconnected, {
+      type: "hello",
+      guestId: "g",
+      displayName: "G",
+      reconnectToken: guestWelcome.reconnectToken,
+    })
     expect(JSON.parse(await nextMessage(reconnected, 1000, "reconnect welcome"))).toMatchObject({
       type: "welcome",
       role: "guest",
