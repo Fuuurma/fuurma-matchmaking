@@ -6,6 +6,7 @@ import {
   MAX_GUEST_ID_LENGTH,
   MAX_MESSAGE_BYTES,
   sanitizeDisplayName,
+  utf8ByteLength,
 } from "./utils"
 
 /**
@@ -127,8 +128,11 @@ export class GameRoomDO extends DurableObject {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    // Reject oversized frames early to prevent memory abuse.
-    const byteLength = typeof message === "string" ? message.length : message.byteLength
+    // Reject oversized frames early to prevent memory abuse. String frames
+    // are measured in UTF-8 bytes (MM-04): .length counts UTF-16 code units,
+    // letting multibyte text exceed the documented wire-byte cap ~4x.
+    const byteLength =
+      typeof message === "string" ? utf8ByteLength(message) : message.byteLength
     if (byteLength > MAX_MESSAGE_BYTES) {
       this.sendError(ws, "invalid", `message too large (max ${MAX_MESSAGE_BYTES} bytes)`)
       return
