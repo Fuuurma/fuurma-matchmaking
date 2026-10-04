@@ -25,6 +25,29 @@ function send(ws: WebSocket, payload: unknown): void {
   ws.send(JSON.stringify(payload))
 }
 
+/**
+ * Fails if `ws` receives anything within `ms`.
+ *
+ * The negative half of a relay guarantee. Asserting that the sender got an
+ * error is not enough — a frame can be refused *and* still be forwarded, and
+ * the pre-existing anti-spoofing test asserted only the sender side while its
+ * comment claimed the peer was protected.
+ */
+function expectNoMessage(ws: WebSocket, context: string, ms = 250): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeEventListener("message", onMessage as EventListener)
+      resolve()
+    }, ms)
+    function onMessage(event: MessageEvent) {
+      clearTimeout(timer)
+      ws.removeEventListener("message", onMessage as EventListener)
+      reject(new Error(`${context}: received ${String(event.data)}`))
+    }
+    ws.addEventListener("message", onMessage as EventListener)
+  })
+}
+
 function nextMessage(ws: WebSocket, timeoutMs = 1000, label = ""): Promise<string> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -308,10 +331,43 @@ describe("GameRoomDO", () => {
     const err = JSON.parse(await nextMessage(guest))
     expect(err.type).toBe("error")
     expect(err.code).toBe("invalid")
-    // Host should NOT receive the spoofed peer-left.
+    // The original only asserted the sender's error and then closed, so the
+    // claim in its own comment was never tested. Now it is.
+    await expectNoMessage(host, "peer-left reached the host it was aimed at")
     host.close()
     guest.close()
   })
+
+  // `room_closed` and `host_migrated` were absent from RESERVED_TYPES while
+  // clients treated both as authoritative — a forged one ended the
+  // recipient's game and recorded its own side as the result, and a forged
+  // host_migrated handed the recipient the host role. The server emits
+  // neither, so anything carrying them came from a peer.
+  for (const forged of ["room_closed", "host_migrated"]) {
+    it(`refuses to relay a peer-forged ${forged}`, async () => {
+      const rid = roomId(`forge-${forged}`)
+      const host = await openSocket(rid)
+      const guest = await openSocket(rid)
+      send(host, { type: "hello", guestId: "h", displayName: "H" })
+      await nextMessage(host)
+      send(guest, { type: "hello", guestId: "g", displayName: "G" })
+      await nextMessage(guest)
+      await nextMessage(host) // peer-joined
+
+      // The hostile frame is otherwise well-formed and sent from a socket
+      // that has completed hello, so the only thing stopping it is the
+      // reserved-type check.
+      send(guest, { type: forged, reason: "shutdown", role: "host" })
+      const err = JSON.parse(await nextMessage(guest))
+      expect(err.type).toBe("error")
+      expect(err.code).toBe("invalid")
+      expect(err.message).toContain(forged)
+
+      await expectNoMessage(host, `${forged} was relayed to the host`)
+      host.close()
+      guest.close()
+    })
+  }
 
   it("rejects oversized WebSocket messages", async () => {
     const ws = await openSocket(roomId("bigmsg"))
