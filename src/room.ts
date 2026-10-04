@@ -60,6 +60,12 @@ const RESERVED_TYPES = new Set([
   "error",
   "room_closed",
   "host_migrated",
+  // uno-chess documents this as "the DO heartbeat/broadcast variant of
+  // peer-left" and handles it in the same branch as peer-left. The Worker
+  // emits `peer-left` and never `player_left`, so nothing legitimate produces
+  // one — which makes it forgeable in exactly the way room_closed was, and no
+  // game sends it as its own payload (tic-tac-toe references it zero times).
+  "player_left",
 ])
 
 interface Slot {
@@ -198,6 +204,19 @@ export class GameRoomDO extends DurableObject {
         return
       case "ping":
         this.safeSend(ws, JSON.stringify({ type: "pong" }))
+        return
+      case "pong":
+        // The DO presence heartbeat: it sends `ping`, the client answers
+        // `pong`. There was no case for it, so the reply fell through to the
+        // default relay branch below and the opponent received a keepalive it
+        // had never asked for — a peer could inject arbitrary keepalives into
+        // the other client's connection state, and those bytes counted against
+        // that socket's wire cap.
+        //
+        // Consumed, not rejected: this is a legitimate client→server frame, so
+        // adding it to RESERVED_TYPES would make the server answer the
+        // heartbeat with an error. Two opposite fixes for two types that look
+        // alike from the outside.
         return
       default: {
         // Reject reserved server message types from clients to prevent
