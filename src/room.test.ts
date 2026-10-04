@@ -318,6 +318,44 @@ describe("GameRoomDO", () => {
     re.close()
   })
 
+  it.fails("a hello cannot claim a disclosed guestId that never connected", async () => {
+    // The join response discloses BOTH guestIds. MM-01 stopped a peer from
+    // RECLAIMING an existing slot, but a hello for a guestId that has no slot
+    // yet creates one with a fresh credential — so a peer that connects first
+    // and claims the opponent's disclosed id takes the slot and locks the
+    // real player out.
+    //
+    // `it.fails` because the secure behaviour is NOT implemented yet: this
+    // body is written to assert it, and currently fails. Whoever closes the
+    // hole must delete the `.fails` — leaving it would make a correct fix
+    // look like a regression. Closing it needs the room to know which
+    // guestIds matchmaking allocated (a per-player capability handed over at
+    // match time), which is a wire-protocol change across the Worker and both
+    // game clients, so it is an owner decision, not a patch.
+    const rid = roomId("preclaim")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+
+    // The opponent is disclosed as "victim" but has never connected.
+    const attacker = await openSocket(rid)
+    send(attacker, { type: "hello", guestId: "victim", displayName: "NotVictim" })
+    const stolen = JSON.parse(await nextMessage(attacker, 1000, "claim of an unconnected id"))
+
+    expect(stolen.type, "claiming an unconnected disclosed guestId must be refused").not.toBe(
+      "welcome",
+    )
+    expect(
+      stolen.reconnectToken,
+      "no credential may be issued for an unallocated id",
+    ).toBeUndefined()
+    const slots = await readSlots(env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid)))
+    expect(
+      slots.map((s) => s.guestId),
+      "only the connecting player holds a slot",
+    ).toEqual(["h"])
+  })
+
   it("backfills a credential for pre-MM-01 slots on uncontested hello (MM-01)", async () => {
     const rid = roomId("legacy")
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
