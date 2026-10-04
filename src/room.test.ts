@@ -40,6 +40,17 @@ function nextMessage(ws: WebSocket, timeoutMs = 1000, label = ""): Promise<strin
   })
 }
 
+type StoredSlot = { guestId: string; disconnectedAt: number | null }
+
+/** Reads the persisted room-state slots from inside the Durable Object. */
+async function readSlots(stub: unknown): Promise<StoredSlot[]> {
+  const state = (await runInDurableObject(
+    stub as never,
+    async (_i: unknown, s: DurableObjectState) => await s.storage.get("room-state"),
+  )) as { slots?: StoredSlot[] } | undefined
+  return state?.slots ?? []
+}
+
 describe("GameRoomDO", () => {
   it("rejects non-WebSocket requests with 426", async () => {
     const id = env.GAME_ROOM.idFromName(roomId("nonws"))
@@ -306,6 +317,86 @@ describe("GameRoomDO", () => {
 
     reconnected.close()
     await nextMessage(host, 1000, "final disconnect")
+    host.close()
+  })
+
+  // F682 / UNO-RECONNECT-01. uno-chess's useOnlineReconnect retries
+  // reconnectOnline() on an escalating backoff — 800ms, 1.6s, 3.2s, 6.4s, 8s,
+  // 8s plus jitter, so ~6 attempts across ~28-33s against a 30s
+  // RECONNECT_GRACE_MS. Roughly half the grace window is spent reconnecting.
+  //
+  // I first assumed the alarm was set once and never restarted, and wrote the
+  // test around that. Reading room.ts disproved it: a successful reconnect
+  // clears `slot.disconnectedAt` in handleHello (:378), and the NEXT
+  // webSocketClose re-runs in full — it re-marks the slot and calls
+  // setAlarm(now + 30s) again (:231). So each disconnect cycle opens a FRESH
+  // 30s window. That is the correct behaviour and the reason it is worth
+  // pinning — a client that is still trying must keep its slot, and one that
+  // stops must lose it 30s after its LAST attempt, not 30s after the first.
+  // That second half is the real contract: the deadline must track the final
+  // attempt, so the peer-left teardown and the re-armed alarm are both
+  // re-observed on every cycle, not just the first.
+  //
+  // NOT covered, and deliberately not faked: that the deadline is pushed a
+  // further 30s out per cycle. The alarm() handler drops ANY disconnected slot
+  // when it fires — it never compares elapsed time against disconnectedAt — so
+  // the 30s guarantee lives entirely in the scheduling, and a millisecond-scale
+  // test env cannot distinguish a deadline set on cycle 1 from one set on cycle
+  // 3 (mutating room.ts:275 leaves this test green). Proving that needs the
+  // paired-client retry loop with real backoff, which is the fixture the
+  // WORK.md P0 asks for and is still outstanding. Recorded, not papered over.
+  it("holds the slot across repeated reconnect cycles and re-arms the grace", async () => {
+    const rid = roomId("recycle3")
+    const host = await openSocket(rid)
+    let guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      guest.close(4000, "reconnecting")
+      expect(JSON.parse(await nextMessage(host, 1000, `teardown ${cycle}`))).toMatchObject({
+        type: "peer-left",
+        reason: "disconnect",
+      })
+
+      // Still connected on this side, so the host keeps the slot, and it is
+      // marked disconnected so the grace clock can expire it.
+      const held = (await readSlots(stub)).find((slot) => slot.guestId === "g")
+      expect(held, `slot held + marked disconnected after teardown ${cycle}`).toMatchObject({
+        disconnectedAt: expect.any(Number),
+      })
+      expect(
+        await runInDurableObject(stub, (_i, s) => s.storage.getAlarm()),
+        `grace armed on teardown ${cycle}`,
+      ).not.toBeNull()
+
+      const back = await openSocket(rid)
+      send(back, { type: "hello", guestId: "g", displayName: "G" })
+      await nextMessage(back, 1000, `reconnect ${cycle} welcome`)
+      await nextMessage(host, 1000, `peer-reconnected ${cycle}`)
+      guest = back
+    }
+
+    // Three full cycles later the grace is armed again and the slot is still
+    // held. The alarm is checked rather than fired on purpose: firing it here
+    // would release the slot and prove nothing about re-arming.
+    guest.close(4000, "reconnecting")
+    await nextMessage(host, 1000, "final teardown")
+    const after = await readSlots(stub)
+    expect(
+      await runInDurableObject(stub, (_i, s) => s.storage.getAlarm()),
+      "grace re-armed on the last teardown",
+    ).not.toBeNull()
+    expect(
+      after.find((slot) => slot.guestId === "g"),
+      "slot survives its own retries",
+    ).toBeDefined()
+
     host.close()
   })
 
