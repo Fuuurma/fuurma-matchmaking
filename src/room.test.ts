@@ -488,8 +488,16 @@ describe("GameRoomDO", () => {
     send(host, { type: "hello", guestId: "h", displayName: "H" })
     await nextMessage(host)
     send(guest, { type: "hello", guestId: "g", displayName: "G" })
-    await nextMessage(guest)
+    const guestWelcome = JSON.parse(await nextMessage(guest))
     await nextMessage(host) // peer-joined
+
+    // MM-01 moved the reconnect contract: a hello carrying only the public
+    // guestId is refused, because the opponent learns that id. This test is
+    // about the GRACE clock re-arming across cycles, not about how a peer
+    // proves it is the same peer, so it now reconnects with the private
+    // credential MM-01 issues and keeps every slot/alarm assertion below.
+    const guestToken: string = guestWelcome.reconnectToken
+    expect(guestToken).toMatch(/^[0-9a-f]{32}$/)
 
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
 
@@ -512,7 +520,7 @@ describe("GameRoomDO", () => {
       ).not.toBeNull()
 
       const back = await openSocket(rid)
-      send(back, { type: "hello", guestId: "g", displayName: "G" })
+      send(back, { type: "hello", guestId: "g", displayName: "G", reconnectToken: guestToken })
       await nextMessage(back, 1000, `reconnect ${cycle} welcome`)
       await nextMessage(host, 1000, `peer-reconnected ${cycle}`)
       guest = back
