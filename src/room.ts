@@ -34,6 +34,21 @@ const MAX_SLOTS = 2
  * Message types owned by the room server. These are never relayed
  * peer-to-peer — a malicious client could otherwise spoof `peer-left`
  * or `welcome` to trick the other peer into a wrong state.
+ *
+ * `room_closed` and `host_migrated` belong here for the same reason, and were
+ * missing until 10-04. Clients treat both as authoritative: `room_closed`
+ * ends the recipient's game and records its own side as the result, and
+ * `host_migrated` assigns the recipient the host role. Neither is emitted by
+ * this Worker yet, so a peer could only ever produce one by sending it — the
+ * `default:` relay branch below forwards anything not listed here verbatim.
+ * The recipient's store even documents the wrong invariant, saying the "DO
+ * tore the room down", which is precisely what a peer-supplied frame
+ * impersonates.
+ *
+ * `pong` and `player_left` are candidates for this set but were left out
+ * rather than guessed at: the client library also models those as
+ * client-originated, so reserving them may be wrong in the other direction.
+ * Tracked rather than silently decided.
  */
 const RESERVED_TYPES = new Set([
   "hello",
@@ -43,6 +58,8 @@ const RESERVED_TYPES = new Set([
   "peer-reconnected",
   "peer-left",
   "error",
+  "room_closed",
+  "host_migrated",
 ])
 
 interface Slot {
