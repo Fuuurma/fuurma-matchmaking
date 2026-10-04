@@ -1004,6 +1004,32 @@ describe("GameRoomDO", () => {
     guest.close()
   })
 
+  it("consumes a client pong instead of relaying it to the peer", async () => {
+    const rid = roomId("heartbeat")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // The DO presence heartbeat: the server pings, the client pongs. This is a
+    // legitimate client->server frame, so it must be accepted silently — an
+    // error here would break the heartbeat — AND must not reach the peer.
+    // Both listeners must be attached BEFORE the send. The first version
+    // awaited the sender-side check first, so on the unfixed code the relayed
+    // pong arrived at the host while nothing was listening for it, the event
+    // was dropped, and the host assertion then passed against a relay that had
+    // demonstrably happened. A guard that observes nothing is not a guard.
+    const senderSilent = expectNoMessage(guest, "server rejected a legitimate heartbeat reply")
+    const peerSilent = expectNoMessage(host, "pong was relayed to the peer")
+    send(guest, { type: "pong" })
+    await Promise.all([senderSilent, peerSilent])
+    host.close()
+    guest.close()
+  })
+
   // `room_closed` and `host_migrated` were absent from RESERVED_TYPES while
   // clients treated both as authoritative — a forged one ended the
   // recipient's game and recorded its own side as the result, and a forged

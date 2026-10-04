@@ -107,9 +107,14 @@ function earliestExpectedDeadline(
  * client library has no send path for it (its `player_left` handling is
  * inbound-only), so reserving cannot break a client-originated flow.
  *
- * `pong` remains unreserved on purpose: the platform answers pings via the
- * auto-response pair and a client-sent pong is inert, so relaying it is
- * harmless. Tracked rather than silently decided.
+ * `pong` stays out of this set deliberately, but for the opposite reason the
+ * older comment guessed: it is a genuinely client-originated frame — the DO
+ * presence heartbeat sends `ping`, the client answers `pong` — so reserving it
+ * would make the server answer every heartbeat with an error. It is not
+ * relayed either: the switch below consumes it silently. Before 10-07 (F734)
+ * the reply fell through to the default relay branch and the opponent
+ * received a keepalive it had never asked for, with those bytes counting
+ * against its 512 KiB wire cap.
  */
 const RESERVED_TYPES = new Set([
   "hello",
@@ -306,6 +311,19 @@ export class GameRoomDO extends DurableObject {
         return
       case "ping":
         this.safeSend(ws, JSON.stringify({ type: "pong" }))
+        return
+      case "pong":
+        // The DO presence heartbeat: it sends `ping`, the client answers
+        // `pong`. There was no case for it, so the reply fell through to the
+        // default relay branch below and the opponent received a keepalive it
+        // had never asked for — a peer could inject arbitrary keepalives into
+        // the other client's connection state, and those bytes counted against
+        // that socket's wire cap.
+        //
+        // Consumed, not rejected: this is a legitimate client→server frame, so
+        // adding it to RESERVED_TYPES would make the server answer the
+        // heartbeat with an error. Two opposite fixes for two types that look
+        // alike from the outside.
         return
       default: {
         // Reject reserved server message types from clients to prevent
