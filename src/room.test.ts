@@ -231,6 +231,52 @@ describe("GameRoomDO", () => {
     host.close()
   })
 
+  // F395 contract. The peer-left reason is decided by one ternary in
+  // room.ts: `code === 1000 && reason === "client closing" ? "closed" :
+  // "disconnect"`. "closed" is TERMINAL — the peer durably records a win.
+  // uno-chess's RoomClient.closeForReconnect tears the socket down with
+  // (4000, "reconnecting") precisely so a transient retry lands on the
+  // "disconnect" side. Both existing tests close with NO code, so they only
+  // ever exercised the implicit branch: inverting the condition — or matching
+  // on the reason alone — would turn every automatic retry into a durable
+  // false win and the whole suite would stay green. Pin both sides.
+  it("maps a reconnect teardown (4000/reconnecting) to a TRANSIENT peer-left", async () => {
+    const rid = roomId("retryclose")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // Exactly what uno-chess sends on an automatic retry.
+    guest.close(4000, "reconnecting")
+    const evt = JSON.parse(await nextMessage(host))
+    expect(evt.type).toBe("peer-left")
+    expect(evt.reason).toBe("disconnect")
+    host.close()
+  })
+
+  it("keeps a voluntary departure (1000/client closing) TERMINAL", async () => {
+    const rid = roomId("quitclose")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // A real quit must keep reporting "closed" — the fix must not have
+    // softened voluntary departures into transient ones.
+    guest.close(1000, "client closing")
+    const evt = JSON.parse(await nextMessage(host))
+    expect(evt.type).toBe("peer-left")
+    expect(evt.reason).toBe("closed")
+    host.close()
+  })
+
   it("keeps a reconnecting peer alive until the grace alarm expires", async () => {
     const rid = roomId("regrace")
     const host = await openSocket(rid)
