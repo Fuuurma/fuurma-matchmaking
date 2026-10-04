@@ -28,6 +28,27 @@ import {
 
 const RECONNECT_GRACE_MS = 30_000
 const HELLO_TIMEOUT_MS = 10_000
+
+/**
+ * Earliest reconnect-grace deadline still outstanding across `slots`.
+ *
+ * Each slot's deadline is derived from its own `disconnectedAt`, never from
+ * "now". Deriving it from `now` on every wake-up made the alarm re-arm itself
+ * `grace` ms into the future each time it fired for an unrelated reason, so a
+ * slot could be kept alive indefinitely and a shorter deadline elsewhere was
+ * masked. Slots whose grace has already elapsed are ignored here: the alarm
+ * handler is what removes them, and by then no such slot remains.
+ */
+function earliestSlotDeadline(slots: ReadonlyArray<Slot>, now: number): number | null {
+  let earliest: number | null = null
+  for (const slot of slots) {
+    if (slot.disconnectedAt === null) continue
+    const deadline = slot.disconnectedAt + RECONNECT_GRACE_MS
+    if (deadline <= now) continue
+    if (earliest === null || deadline < earliest) earliest = deadline
+  }
+  return earliest
+}
 const MAX_SLOTS = 2
 
 /**
@@ -297,7 +318,11 @@ export class GameRoomDO extends DurableObject {
         changed = true
         return true
       }
-      // Grace expired and peer didn't reconnect — remove the slot.
+      // The alarm can fire for a reason that has nothing to do with this
+      // slot — a pending socket's 10s hello timeout, say. Expire a slot only
+      // once its OWN grace window has elapsed, otherwise that timeout deletes
+      // a player who still has most of their 30s left to reclaim.
+      if (slot.disconnectedAt + RECONNECT_GRACE_MS > now) return true
       removedGuestIds.push(slot.guestId)
       changed = true
       return false
@@ -305,9 +330,11 @@ export class GameRoomDO extends DurableObject {
 
     if (changed) await this.saveState(state)
 
-    const nextSlotDeadline = state.slots.some((s) => s.disconnectedAt !== null)
-      ? now + RECONNECT_GRACE_MS
-      : null
+    // The next wake-up is the earliest REAL deadline still outstanding: a
+    // slot's own grace expiry, or a pending handshake below. Re-deriving this
+    // as `now + RECONNECT_GRACE_MS` on every wake-up pushed each slot's
+    // deadline further out every time the alarm fired for anything else.
+    const nextSlotDeadline = earliestSlotDeadline(state.slots, now)
     const nextAlarm =
       nextPendingDeadline === null
         ? nextSlotDeadline
@@ -511,9 +538,10 @@ export class GameRoomDO extends DurableObject {
 
   private async scheduleRoomAlarm(state: RoomState): Promise<void> {
     const now = Date.now()
-    let nextAlarm: number | null = state.slots.some((slot) => slot.disconnectedAt !== null)
-      ? now + RECONNECT_GRACE_MS
-      : null
+    // Earliest outstanding slot grace, not `now + grace` — see the alarm
+    // handler. Re-arming from `now` on every close pushed a slot's real
+    // expiry outwards each time anything else touched the alarm.
+    let nextAlarm = earliestSlotDeadline(state.slots, now)
 
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as RoomAttachment | null

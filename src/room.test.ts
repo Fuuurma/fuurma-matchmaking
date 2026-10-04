@@ -481,6 +481,102 @@ describe("GameRoomDO", () => {
   // 3 (mutating room.ts:275 leaves this test green). Proving that needs the
   // paired-client retry loop with real backoff, which is the fixture the
   // WORK.md P0 asks for and is still outstanding. Recorded, not papered over.
+  it("keeps a disconnected slot when an unrelated hello timeout fires mid-grace", async () => {
+    // A disconnect arms a 30s grace. A NEW socket that never says hello arms
+    // a 10s handshake alarm, and that alarm becomes the earliest deadline.
+    // When it fires it must expire only the pending socket — a player's slot
+    // is reclaimable for its own full 30s regardless of what woke the alarm.
+    //
+    // Before the fix the handler removed every disconnected slot on any alarm
+    // and recomputed the next deadline as now + 30s, so this pending timeout
+    // deleted the legitimate slot ~10s in, cutting the grace short.
+    const rid = roomId("alarmgrc")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    const guestWelcome = JSON.parse(await nextMessage(guest))
+    await nextMessage(host) // peer-joined
+
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const guestToken: string = guestWelcome.reconnectToken
+
+    // Guest drops; the slot is held for 30s.
+    guest.close(4000, "reconnecting")
+    await nextMessage(host, 1000, "teardown")
+
+    // Age the disconnect by 5s so the grace has a measurable remainder. The
+    // suite runs in milliseconds, so without this the real deadline and a
+    // re-derived `now + 30s` are indistinguishable and the assertion below
+    // would pass against the bug.
+    // 25s, not 5s: the slot's remaining 5s must be the EARLIEST outstanding
+    // deadline, otherwise the pending hello's 10s timeout wins the Math.min
+    // under both the fix and the bug and the re-arm assertion cannot tell
+    // them apart.
+    const AGED_BY_MS = 25_000
+    await runInDurableObject(stub, async (_i, s) => {
+      const stored = (await s.storage.get("room-state")) as {
+        slots: Array<{ guestId: string; disconnectedAt: number | null }>
+      }
+      for (const slot of stored.slots) {
+        if (slot.disconnectedAt !== null) slot.disconnectedAt -= AGED_BY_MS
+      }
+      await s.storage.put("room-state", stored)
+    })
+
+    const held = (await readSlots(stub)).find((slot) => slot.guestId === "g")
+    expect(held, "slot held after teardown").toMatchObject({ disconnectedAt: expect.any(Number) })
+    const graceArmed = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())
+    expect(graceArmed, "grace armed on teardown").not.toBeNull()
+
+    // An unrelated socket connects and never completes its hello, so the
+    // handshake alarm becomes the earliest deadline.
+    const pending = await openSocket(rid)
+    const alarmBefore = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())
+    expect(alarmBefore, "an alarm is scheduled while a slot is disconnected").not.toBeNull()
+    expect(
+      alarmBefore === null ? 0 : alarmBefore - Date.now(),
+      "pending hello deadline is earlier than the player's 30s grace",
+    ).toBeLessThan(29_000)
+
+    // Fire that alarm. It is the handshake timeout, not the grace expiring.
+    await runDurableObjectAlarm(stub)
+
+    // The disconnected player's slot must survive, still reclaimable.
+    const stillHeld = (await readSlots(stub)).find((slot) => slot.guestId === "g")
+    expect(stillHeld, "slot survives an unrelated alarm mid-grace").toMatchObject({
+      disconnectedAt: expect.any(Number),
+    })
+
+    // And the re-armed alarm must point at THAT slot's real deadline, not at
+    // `now + 30s`. Re-deriving from `now` on every wake-up pushed the expiry
+    // further out each time anything else woke the alarm, so a slot could be
+    // kept alive indefinitely. Pinning it to the slot's own `disconnectedAt`
+    // is what makes that impossible.
+    const rearmed = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())
+    expect(rearmed, "grace re-armed after the unrelated alarm").not.toBeNull()
+    const disconnectedAt = stillHeld?.disconnectedAt
+    expect(typeof disconnectedAt, "slot still carries its disconnect timestamp").toBe("number")
+    expect(
+      rearmed === null || typeof disconnectedAt !== "number" ? -1 : rearmed - disconnectedAt,
+      "re-armed alarm is the slot's own deadline, not now + 30s",
+    ).toBeLessThanOrEqual(30_000)
+
+    // Drop the pending socket before reclaiming: the room admits MAX_SLOTS
+    // live connections, so leaving a third one open just earns a 429.
+    pending.close(1000, "done")
+
+    // And the credential it was issued must still work.
+    const back = await openSocket(rid)
+    send(back, { type: "hello", guestId: "g", displayName: "G", reconnectToken: guestToken })
+    const welcome = JSON.parse(await nextMessage(back, 1000, "reclaim after unrelated alarm"))
+    expect(welcome.role, "original player reclaimed its own slot").toBe("guest")
+    expect(JSON.parse(await nextMessage(host, 1000, "peer-reconnected")).type).toBe(
+      "peer-reconnected",
+    )
+  })
+
   it("holds the slot across repeated reconnect cycles and re-arms the grace", async () => {
     const rid = roomId("recycle3")
     const host = await openSocket(rid)
@@ -556,7 +652,12 @@ describe("GameRoomDO", () => {
         game: "tictactoe",
         slots: [
           { guestId: "h", displayName: "H", role: "host", disconnectedAt: null },
-          { guestId: "g", displayName: "G", role: "guest", disconnectedAt: Date.now() - 1 },
+          // Seeded ALREADY past its 30s grace. This used to be
+          // `Date.now() - 1`, i.e. a slot with 29999ms of grace left, and the
+          // handler removed it on any alarm — which is the very defect the
+          // "unrelated hello timeout" test now pins. Expiry is only legitimate
+          // once the slot's own window has elapsed.
+          { guestId: "g", displayName: "G", role: "guest", disconnectedAt: Date.now() - 30_001 },
         ],
       }),
     )
