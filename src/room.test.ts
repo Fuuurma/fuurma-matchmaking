@@ -356,7 +356,7 @@ describe("GameRoomDO", () => {
     ).toEqual(["h"])
   })
 
-  it("backfills a credential for pre-MM-01 slots on uncontested hello (MM-01)", async () => {
+  it("refuses to mint a credential for a pre-MM-01 slot's first claimant", async () => {
     const rid = roomId("legacy")
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
     await runInDurableObject(stub, (_instance, state) =>
@@ -365,19 +365,32 @@ describe("GameRoomDO", () => {
         slots: [{ guestId: "old", displayName: "O", role: "host", disconnectedAt: 1 }],
       }),
     )
+
+    // A pre-MM-01 slot has no credential to check, and the opponent learns
+    // guestId from welcome/peer-joined — so "first claimant" is not evidence
+    // of ownership. Handing this caller a fresh credential is the bug.
     const ws = await openSocket(rid)
     send(ws, { type: "hello", guestId: "old", displayName: "O" })
-    const welcome = JSON.parse(await nextMessage(ws))
-    expect(welcome.type).toBe("welcome")
-    expect(welcome.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
+    const err = JSON.parse(await nextMessage(ws))
+    expect(err.type).toBe("error")
+    expect(err.message ?? err.reason ?? JSON.stringify(err)).toMatch(/legacy/i)
     ws.close()
 
-    // From now on the credential is required.
-    const ws2 = await openSocket(rid)
-    send(ws2, { type: "hello", guestId: "old", displayName: "O" })
-    const err = JSON.parse(await nextMessage(ws2))
-    expect(err.type).toBe("error")
-    ws2.close()
+    // The identity is retired, not migrated: no slot is left to claim, so a
+    // second attempt cannot inherit it either.
+    const persisted = (await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get("room-state"),
+    )) as { slots?: unknown[] } | undefined
+    expect(persisted?.slots ?? []).toHaveLength(0)
+
+    // Rejoining as a new player works and mints a real credential, so the
+    // legacy population drains instead of deadlocking the room.
+    const fresh = await openSocket(rid)
+    send(fresh, { type: "hello", guestId: "old-2", displayName: "O" })
+    const welcome = JSON.parse(await nextMessage(fresh))
+    expect(welcome.type).toBe("welcome")
+    expect(welcome.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
+    fresh.close()
   })
 
   it("rejects duplicate guestId while a live socket exists", async () => {

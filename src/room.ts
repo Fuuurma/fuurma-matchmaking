@@ -92,8 +92,9 @@ interface Slot {
    * Private per-player reconnect credential (MM-01). Minted when the slot is
    * created, returned only in that socket's `welcome`, and required to
    * reclaim the slot after a disconnect. Never sent to the opponent.
-   * Slots persisted before MM-01 lack this field and get one backfilled on
-   * their next uncontested hello (see handleHello).
+   * Slots persisted before MM-01 lack this field and are NOT backfilled:
+   * there is no way to tell the owner from the opponent, so the first
+   * claimant retires the identity instead (see handleHello).
    */
   reconnectToken: string
 }
@@ -410,11 +411,36 @@ export class GameRoomDO extends DurableObject {
         return
       }
       if (!existing.reconnectToken) {
-        // Legacy slot persisted before MM-01: backfill on this uncontested
-        // hello (no active socket holds the identity) and require the
-        // credential from now on.
-        existing.reconnectToken = generateReconnectToken()
-      } else if (presented !== existing.reconnectToken) {
+        // Legacy slot persisted before MM-01. These are real, not
+        // hypothetical: the deployed Worker is still the 2026-09-15 upload
+        // (STATE.md), so rooms created by it carry no credential at all.
+        //
+        // There is no credential to check here, and minting one hands the
+        // pre-credential identity to whoever claims it first. "Uncontested"
+        // only meant no socket was attached — which is exactly the state a
+        // legitimate player is in while reconnecting, and the opponent
+        // learns guestId from welcome/peer-joined, so the first claimant is
+        // frequently not the owner.
+        //
+        // So the identity is retired rather than migrated: the slot is
+        // dropped and the caller is told to rejoin as a new player. A fresh
+        // join always mints a credential, so the legacy population drains
+        // instead of being handed out. Bounded cost: a room that is live
+        // across the MM-01 deploy and whose player reconnects has to start
+        // over, rather than silently losing the seat to the other peer.
+        state.slots = state.slots.filter((s) => s !== existing)
+        await this.saveState(state)
+        for (const other of this.ctx.getWebSockets()) {
+          // Not to the rejected socket — it gets the error below, and a
+          // peer-left frame would only be noise on a connection being closed.
+          if (other === ws) continue
+          this.safeSend(other, JSON.stringify({ type: "peer-left", reason: "expired" }))
+        }
+        this.sendError(ws, "invalid", "legacy slot expired — rejoin as a new player")
+        ws.close(1008, "reconnect rejected")
+        return
+      }
+      if (presented !== existing.reconnectToken) {
         this.sendError(ws, "invalid", "reconnect credential required")
         ws.close(1008, "reconnect rejected")
         return
