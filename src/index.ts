@@ -10,6 +10,7 @@ import {
   MAX_GUEST_ID_LENGTH,
   MAX_JSON_BODY_BYTES,
   MAX_PEER_ID_LENGTH,
+  MAX_TICKET_LENGTH,
   sanitizeDisplayName,
   utf8ByteLength,
 } from "./utils"
@@ -21,6 +22,15 @@ export interface MatchmakingRequest {
   peerId: string
   displayName?: string
   guestId?: string
+  /**
+   * Proof that a duplicate join is the same client that created the existing
+   * queue entry. `peerId` alone is not enough: it is disclosed to the opponent
+   * in the match payload, so anyone holding a matched player's peerId could
+   * otherwise call join and be handed that player's live waiting ticket — a
+   * bearer credential for poll/leave. Clients present the ticket they already
+   * hold; a caller who cannot produce it is not the owner and gets nothing.
+   */
+  retryTicket?: string
 }
 
 export interface Match {
@@ -181,6 +191,14 @@ export class MatchmakingQueues extends DurableObject {
     ) {
       return jsonResponse({ error: `guestId must be 1-${MAX_GUEST_ID_LENGTH} chars` }, 400)
     }
+    if (
+      req.retryTicket !== undefined &&
+      (typeof req.retryTicket !== "string" ||
+        req.retryTicket.length < 1 ||
+        req.retryTicket.length > MAX_TICKET_LENGTH)
+    ) {
+      return jsonResponse({ error: `retryTicket must be 1-${MAX_TICKET_LENGTH} chars` }, 400)
+    }
     if (req.displayName !== undefined) {
       if (typeof req.displayName !== "string") {
         return jsonResponse({ error: "displayName must be a string" }, 400)
@@ -225,16 +243,38 @@ export class MatchmakingQueues extends DurableObject {
       joinedAt: now,
     }
 
-    // Guard: one active queue entry per peerId. If the same player re-joins
-    // (e.g. lost their ticket and retried), return their existing waiting
-    // ticket instead of creating a duplicate queue entry. Refresh joinedAt
-    // so the 30s queue timeout resets on each rejoin attempt.
+    // One active queue entry per peerId. A genuine retry (the response was
+    // lost, the client still holds its ticket) must not create a duplicate
+    // entry, so it gets the existing one back. But `peerId` is not a secret —
+    // it travels to the opponent inside the match payload — so it cannot by
+    // itself authorize handing out the waiting ticket, which is a bearer
+    // credential for poll/leave. The caller has to prove ownership by
+    // presenting the ticket the server issued. Without it we neither return
+    // the ticket nor touch `joinedAt`: refreshing on an unproven call would
+    // let a stranger pin a victim's queue entry open indefinitely. The
+    // real owner keeps their own entry alive by polling (handlePoll), so
+    // refusing the refresh costs them nothing.
     const existingEntry = queue.find((p) => p.peerId === player.peerId)
     if (existingEntry) {
+      if (req.retryTicket !== existingEntry.ticket) {
+        logEvent("warn", "duplicate_join_rejected_unproven", {
+          game,
+          peerId: player.peerId.slice(0, 8),
+          presented: req.retryTicket === undefined ? "none" : "mismatch",
+        })
+        return jsonResponse(
+          {
+            error: "already queued",
+            code: "retry_proof_required",
+            detail: "Re-present the waiting ticket to recover this queue entry.",
+          },
+          409,
+        )
+      }
       existingEntry.joinedAt = now
       state.queues[game] = queue
       await this.saveState(state)
-      logEvent("warn", "duplicate_join_returned_existing", {
+      logEvent("info", "duplicate_join_returned_existing", {
         game,
         peerId: player.peerId.slice(0, 8),
       })

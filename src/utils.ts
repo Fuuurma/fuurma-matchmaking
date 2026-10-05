@@ -24,6 +24,13 @@ export const MAX_PEER_ID_LENGTH = 128
 export const MAX_GUEST_ID_LENGTH = 64
 export const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/
 
+/**
+ * Max length of a client-presented ticket (`retryTicket`). Server-issued
+ * tickets are 32 hex chars (128 bits), so this only has to reject obviously
+ * bogus or oversized payloads before they reach the credential comparison.
+ */
+export const MAX_TICKET_LENGTH = 64
+
 export function isValidRoomId(value: string): boolean {
   return ROOM_ID_PATTERN.test(value)
 }
