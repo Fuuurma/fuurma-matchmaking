@@ -66,10 +66,19 @@ const MAX_SLOTS = 2
  * tore the room down", which is precisely what a peer-supplied frame
  * impersonates.
  *
- * `pong` and `player_left` are candidates for this set but were left out
- * rather than guessed at: the client library also models those as
- * client-originated, so reserving them may be wrong in the other direction.
- * Tracked rather than silently decided.
+ * `player_left` was left out on the same reasoning and that reasoning was
+ * wrong. The comment claimed the client library models it as
+ * client-originated; it does the opposite. `uno-chess/src/lib/room.ts`
+ * documents it as a DO→survivor broadcast (reap, and the first half of host
+ * migration), and its transport maps it onto the same handler as `peer-left`,
+ * which ends the live match and records a result. Since this Worker emits no
+ * heartbeat and no reap, every `player_left` on the wire came from a peer — and
+ * a guest could send one to end the host's game on its own schedule and lock in
+ * a win it was ahead on. Absence of a producer is not absence of a forger.
+ *
+ * `pong` is the one that stayed out deliberately, and for the opposite reason:
+ * it is genuinely client-originated, the protocol layer consumes it, and
+ * reserving it would only remove noise rather than close a hole.
  */
 const RESERVED_TYPES = new Set([
   "hello",
@@ -81,6 +90,7 @@ const RESERVED_TYPES = new Set([
   "error",
   "room_closed",
   "host_migrated",
+  "player_left",
 ])
 
 interface Slot {

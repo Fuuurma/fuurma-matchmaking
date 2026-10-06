@@ -766,6 +766,41 @@ describe("GameRoomDO", () => {
     })
   }
 
+  // `player_left` was absent from RESERVED_TYPES while every uno-chess client
+  // treats it as server-authoritative: transportWS maps it onto the same
+  // peer_left path as `peer-left`, and the handler ends the live match and
+  // records a result. The Worker emits no such frame (there is no heartbeat and
+  // no reap; the relay emits `peer-left`), so anything carrying the type came
+  // from a peer. The forged payload below satisfies the client's own
+  // PlayerLeftMessageSchema, so it would have been honoured end to end.
+  it("refuses to relay a peer-forged player_left", async () => {
+    const rid = roomId("forge-player-left")
+    const host = await openSocket(rid)
+    const guest = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // The exact shape a hostile guest would send: its own id, its own role,
+    // and a final reason so the host credits itself the win.
+    send(guest, {
+      type: "player_left",
+      guestId: "g",
+      role: "guest",
+      reason: "expired",
+    })
+    const err = JSON.parse(await nextMessage(guest))
+    expect(err.type).toBe("error")
+    expect(err.code).toBe("invalid")
+    expect(err.message).toContain("player_left")
+
+    await expectNoMessage(host, "player_left reached the host it was aimed at")
+    host.close()
+    guest.close()
+  })
+
   it("rejects oversized WebSocket messages", async () => {
     const ws = await openSocket(roomId("bigmsg"))
     send(ws, { type: "hello", guestId: "big", displayName: "B" })
