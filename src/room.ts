@@ -66,10 +66,16 @@ const MAX_SLOTS = 2
  * tore the room down", which is precisely what a peer-supplied frame
  * impersonates.
  *
- * `pong` and `player_left` are candidates for this set but were left out
- * rather than guessed at: the client library also models those as
- * client-originated, so reserving them may be wrong in the other direction.
- * Tracked rather than silently decided.
+ * `player_left` joined 10-07 (F734): it is the DO's heartbeat/end variant of
+ * `peer-left` and the client treats it as server-authoritative — a forged one
+ * ended the host's match and committed a result. Both sides of the contract
+ * were checked before reserving it: no server code emits it yet, and the
+ * client library has no send path for it (its `player_left` handling is
+ * inbound-only), so reserving cannot break a client-originated flow.
+ *
+ * `pong` remains unreserved on purpose: the platform answers pings via the
+ * auto-response pair and a client-sent pong is inert, so relaying it is
+ * harmless. Tracked rather than silently decided.
  */
 const RESERVED_TYPES = new Set([
   "hello",
@@ -78,6 +84,7 @@ const RESERVED_TYPES = new Set([
   "peer-joined",
   "peer-reconnected",
   "peer-left",
+  "player_left",
   "error",
   "room_closed",
   "host_migrated",

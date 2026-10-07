@@ -823,8 +823,11 @@ describe("GameRoomDO", () => {
   // clients treated both as authoritative — a forged one ended the
   // recipient's game and recorded its own side as the result, and a forged
   // host_migrated handed the recipient the host role. The server emits
-  // neither, so anything carrying them came from a peer.
-  for (const forged of ["room_closed", "host_migrated"]) {
+  // neither, so anything carrying them came from a peer. `player_left` is
+  // the same class (F734): the DO's heartbeat/end variant of peer-left, and
+  // the client records a match result on receiving it — while no server code
+  // and no client send path ever produces it.
+  for (const forged of ["room_closed", "host_migrated", "player_left"]) {
     it(`refuses to relay a peer-forged ${forged}`, async () => {
       const rid = roomId(`forge-${forged}`)
       const host = await openSocket(rid)
