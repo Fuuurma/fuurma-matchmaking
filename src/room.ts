@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers"
 import {
   ALLOWED_GAMES,
+  corsHeaders,
   jsonResponse,
   logEvent,
   MAX_GUEST_ID_LENGTH,
@@ -166,7 +167,7 @@ export class GameRoomDO extends DurableObject {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade", {
         status: 426,
-        headers: { "Access-Control-Allow-Origin": "*" },
+        headers: corsHeaders(),
       })
     }
 
