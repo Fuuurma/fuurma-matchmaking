@@ -318,26 +318,33 @@ describe("GameRoomDO", () => {
     re.close()
   })
 
-  it.fails("a hello cannot claim a disclosed guestId that never connected", async () => {
+  it("a hello cannot claim a disclosed guestId without its join capability", async () => {
     // The join response discloses BOTH guestIds. MM-01 stopped a peer from
-    // RECLAIMING an existing slot, but a hello for a guestId that has no slot
-    // yet creates one with a fresh credential — so a peer that connects first
-    // and claims the opponent's disclosed id takes the slot and locks the
-    // real player out.
-    //
-    // `it.fails` because the secure behaviour is NOT implemented yet: this
-    // body is written to assert it, and currently fails. Whoever closes the
-    // hole must delete the `.fails` — leaving it would make a correct fix
-    // look like a regression. Closing it needs the room to know which
-    // guestIds matchmaking allocated (a per-player capability handed over at
-    // match time), which is a wire-protocol change across the Worker and both
-    // game clients, so it is an owner decision, not a patch.
+    // RECLAIMING an existing slot; the pre-claim fix stops a peer from
+    // CLAIMING an allocated id it never received — matchmaking pushes a
+    // per-player slotToken to the room before the match is disclosed, and a
+    // first hello must present the token bound to its guestId.
     const rid = roomId("preclaim")
-    const host = await openSocket(rid)
-    send(host, { type: "hello", guestId: "h", displayName: "H" })
-    await nextMessage(host)
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await stub.fetch(
+      new Request("https://room.internal/expect", {
+        method: "POST",
+        body: JSON.stringify({
+          slots: [
+            { guestId: "h", token: "tok-host", role: "host" },
+            { guestId: "victim", token: "tok-victim", role: "guest" },
+          ],
+        }),
+      }),
+    )
 
-    // The opponent is disclosed as "victim" but has never connected.
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H", slotToken: "tok-host" })
+    const hostWelcome = JSON.parse(await nextMessage(host))
+    expect(hostWelcome.type).toBe("welcome")
+
+    // The opponent is disclosed as "victim" but the attacker never received
+    // its slotToken — the disclosed id alone is not a capability.
     const attacker = await openSocket(rid)
     send(attacker, { type: "hello", guestId: "victim", displayName: "NotVictim" })
     const stolen = JSON.parse(await nextMessage(attacker, 1000, "claim of an unconnected id"))
@@ -354,6 +361,70 @@ describe("GameRoomDO", () => {
       slots.map((s) => s.guestId),
       "only the connecting player holds a slot",
     ).toEqual(["h"])
+    host.close()
+    attacker.close()
+  })
+
+  it("an allocated room rejects a hello with the wrong slotToken", async () => {
+    const rid = roomId("wrongtoken")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await stub.fetch(
+      new Request("https://room.internal/expect", {
+        method: "POST",
+        body: JSON.stringify({
+          slots: [
+            { guestId: "h", token: "tok-host", role: "host" },
+            { guestId: "g", token: "tok-guest", role: "guest" },
+          ],
+        }),
+      }),
+    )
+    const ws = await openSocket(rid)
+    send(ws, { type: "hello", guestId: "g", displayName: "G", slotToken: "wrong" })
+    const res = JSON.parse(await nextMessage(ws, 1000, "wrong-token hello"))
+    expect(res.type).not.toBe("welcome")
+    ws.close()
+  })
+
+  it("an unallocated room keeps open guestId claim semantics", async () => {
+    // Invite/direct rooms receive no /expect push — hello keeps working on
+    // the disclosed-guestId contract alone.
+    const rid = roomId("openmode")
+    const ws = await openSocket(rid)
+    send(ws, { type: "hello", guestId: "anyone", displayName: "A" })
+    const res = JSON.parse(await nextMessage(ws))
+    expect(res.type).toBe("welcome")
+    expect(res.role).toBe("host")
+    ws.close()
+  })
+
+  it("the allocation binds the role, not the client's claim", async () => {
+    const rid = roomId("rolebind")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await stub.fetch(
+      new Request("https://room.internal/expect", {
+        method: "POST",
+        body: JSON.stringify({
+          slots: [
+            { guestId: "h", token: "tok-host", role: "host" },
+            { guestId: "g", token: "tok-guest", role: "guest" },
+          ],
+        }),
+      }),
+    )
+    // Guest asks for the host role; the allocation's role wins.
+    const ws = await openSocket(rid)
+    send(ws, {
+      type: "hello",
+      guestId: "g",
+      displayName: "G",
+      slotToken: "tok-guest",
+      role: "host",
+    })
+    const res = JSON.parse(await nextMessage(ws))
+    expect(res.type).toBe("welcome")
+    expect(res.role).toBe("guest")
+    ws.close()
   })
 
   it("backfills a credential for pre-MM-01 slots on uncontested hello (MM-01)", async () => {

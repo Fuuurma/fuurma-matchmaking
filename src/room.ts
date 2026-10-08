@@ -107,6 +107,16 @@ function generateReconnectToken(): string {
 interface RoomState {
   game: string
   slots: Slot[]
+  /**
+   * Per-player join capabilities pushed by matchmaking when it pairs two
+   * players into this room (pre-claim fix, 2026-10-08). When present, a
+   * first `hello` must present the slotToken bound to its guestId — the
+   * match response discloses BOTH guestIds, so a peer that connects first
+   * could otherwise claim the opponent's id and lock them out. Rooms that
+   * never received an allocation (invite links, direct room joins) keep
+   * open guestId-claim semantics.
+   */
+  expected?: Record<string, { token: string; role: "host" | "guest" }>
 }
 
 interface ConnectionAttachment {
@@ -137,6 +147,14 @@ export class GameRoomDO extends DurableObject {
   }
 
   override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    // Internal allocation handoff from MatchmakingQueues. Publicly
+    // unreachable: the Worker's router only forwards GET /room/{id}
+    // upgrades, so a POST at this path can only arrive via a same-Worker
+    // DO binding call — no shared secret is needed.
+    if (request.method === "POST" && url.pathname === "/expect") {
+      return this.handleExpect(request)
+    }
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade", {
         status: 426,
@@ -144,7 +162,6 @@ export class GameRoomDO extends DurableObject {
       })
     }
 
-    const url = new URL(request.url)
     const rawGame = url.searchParams.get("game")
     const game = rawGame ?? "tictactoe"
     if (!ALLOWED_GAMES.has(game)) {
@@ -358,9 +375,54 @@ export class GameRoomDO extends DurableObject {
     }
   }
 
+  /**
+   * Records the per-player join capabilities matchmaking issued when it
+   * paired a room (pre-claim fix). Idempotent — retries overwrite the same
+   * values, so a lost handoff can be re-pushed without corrupting live
+   * slots. Refuses allocation only for a malformed body; never touches
+   * existing slots.
+   */
+  private async handleExpect(request: Request): Promise<Response> {
+    let body: unknown
+    try {
+      body = await request.json()
+    } catch {
+      return jsonResponse({ error: "invalid JSON" }, 400)
+    }
+    const slots = (body as { slots?: unknown })?.slots
+    if (!Array.isArray(slots) || slots.length < 1 || slots.length > MAX_SLOTS) {
+      return jsonResponse({ error: "slots must be a 1-2 entry array" }, 400)
+    }
+    const parsed: Record<string, { token: string; role: "host" | "guest" }> = {}
+    for (const s of slots) {
+      const e = s as { guestId?: unknown; token?: unknown; role?: unknown }
+      if (
+        typeof e?.guestId !== "string" ||
+        e.guestId.length < 1 ||
+        e.guestId.length > MAX_GUEST_ID_LENGTH ||
+        typeof e?.token !== "string" ||
+        e.token.length < 1 ||
+        (e.role !== "host" && e.role !== "guest")
+      ) {
+        return jsonResponse({ error: "each slot needs guestId, token, role" }, 400)
+      }
+      parsed[e.guestId] = { token: e.token, role: e.role }
+    }
+    const state = await this.loadState()
+    state.expected = { ...(state.expected ?? {}), ...parsed }
+    await this.saveState(state)
+    return jsonResponse({ ok: true })
+  }
+
   private async handleHello(
     ws: WebSocket,
-    msg: { guestId: string; displayName?: string; role?: unknown; reconnectToken?: unknown },
+    msg: {
+      guestId: string
+      displayName?: string
+      role?: unknown
+      reconnectToken?: unknown
+      slotToken?: unknown
+    },
   ): Promise<void> {
     const pending = ws.deserializeAttachment() as PendingConnectionAttachment | null
     if (pending?.pending !== true || Date.now() - pending.connectedAt > HELLO_TIMEOUT_MS) {
@@ -424,13 +486,28 @@ export class GameRoomDO extends DurableObject {
       slot = existing
       isReconnect = true
     } else {
+      // Pre-claim binding (F-new-room-initial-slot-auth-2026-10-03): a
+      // matchmade room knows which guestIds matchmaking allocated and holds
+      // a private slotToken per player. A first hello must present the
+      // matching token — the disclosed guestId alone is not a capability.
+      // Unallocated rooms (invite links) keep open claim semantics.
+      const expected = state.expected?.[msg.guestId]
+      if (state.expected) {
+        const presented = typeof msg.slotToken === "string" ? msg.slotToken : null
+        if (!expected || presented !== expected.token) {
+          this.sendError(ws, "invalid", "join capability required")
+          ws.close(1008, "join refused")
+          return
+        }
+      }
       if (state.slots.length >= MAX_SLOTS) {
         this.sendError(ws, "unknown", "room full")
         ws.close(1013, "room full")
         return
       }
 
-      let role: "host" | "guest" = requestedRole ?? (state.slots.length === 0 ? "host" : "guest")
+      let role: "host" | "guest" =
+        expected?.role ?? requestedRole ?? (state.slots.length === 0 ? "host" : "guest")
       // If the requested role is already taken, fall back to the other one.
       const takenRoles = new Set(state.slots.map((s) => s.role))
       if (takenRoles.has(role)) {

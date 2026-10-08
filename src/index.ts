@@ -39,9 +39,22 @@ export interface Match {
 
 type MatchWithRole = Match & { role: "host" | "guest"; game: string; createdAt: number }
 
+/**
+ * Stored per-ticket match record. `slots` carries BOTH players' join
+ * capabilities (pre-claim fix, 2026-10-08) so a poll retry can re-push the
+ * room allocation if the first DO→DO handoff failed; the response surface
+ * only ever exposes the poller's own token. `slotsBound` records that the
+ * GameRoomDO acknowledged the allocation — until then the room has open
+ * semantics, so a matched response is withheld while unbound.
+ */
+type MatchRecord = MatchWithRole & {
+  slots?: { host: string; guest: string }
+  slotsBound?: boolean
+}
+
 export type MatchmakingResponse =
   | { status: "waiting"; ticket: string; roomId: string }
-  | { status: "matched"; match: MatchWithRole }
+  | { status: "matched"; match: MatchWithRole; slotToken: string }
 
 interface Player {
   ticket: string
@@ -54,7 +67,7 @@ interface Player {
 
 interface QueueState {
   queues: Record<string, Player[]>
-  matches: Record<string, MatchWithRole>
+  matches: Record<string, MatchRecord>
   rateLimits?: Record<string, { count: number; windowStartedAt: number }>
 }
 
@@ -146,7 +159,7 @@ export class MatchmakingQueues extends DurableObject {
     return queue
   }
 
-  private async getMatches(): Promise<Record<string, MatchWithRole>> {
+  private async getMatches(): Promise<Record<string, MatchRecord>> {
     const state = await this.loadState()
     const now = Date.now()
     const before = Object.keys(state.matches).length
@@ -262,12 +275,29 @@ export class MatchmakingQueues extends DurableObject {
         },
       }
       const matchWithRole = { ...match, game, createdAt: now }
-      state.matches[opponent.ticket] = { ...matchWithRole, role: "host" }
-      state.matches[player.ticket] = { ...matchWithRole, role: "guest" }
+      // Per-player join capabilities (pre-claim fix): matchmaking issues a
+      // private slotToken per player and hands the allocation to the room
+      // DO before the match is disclosed. The response only carries the
+      // joiner's own token — the opponent's stays in the stored record.
+      const slots = { host: generateTicket(), guest: generateTicket() }
+      state.matches[opponent.ticket] = { ...matchWithRole, role: "host", slots }
+      state.matches[player.ticket] = { ...matchWithRole, role: "guest", slots }
+      await this.saveState(state)
+      const bound = await this.bindRoomSlots(match.roomId, match, slots)
+      if (!bound) {
+        // Fail closed: keep the joiner polling; the retry path in
+        // handlePoll re-pushes until the room acknowledges or the match
+        // times out. A matched response before the room is bound would
+        // reopen the pre-claim hole this commit exists to close.
+        return jsonResponse({ status: "waiting", ticket, roomId })
+      }
+      state.matches[opponent.ticket].slotsBound = true
+      state.matches[player.ticket].slotsBound = true
       await this.saveState(state)
       return jsonResponse({
         status: "matched",
         match: { ...match, role: "guest", game, createdAt: now },
+        slotToken: slots.guest,
       })
     }
 
@@ -309,11 +339,62 @@ export class MatchmakingQueues extends DurableObject {
     return null
   }
 
+  /**
+   * Pushes the match's slot allocation to the GameRoomDO for `roomId`.
+   * Idempotent — the DO merges entries — so callers retry freely. Returns
+   * false on any failure; callers must NOT disclose the match while unbound
+   * (an unbound room has open claim semantics, which is the pre-claim hole).
+   */
+  private async bindRoomSlots(
+    roomId: string,
+    match: Match,
+    slots: { host: string; guest: string },
+  ): Promise<boolean> {
+    try {
+      const stub = this.env.GAME_ROOM.get(this.env.GAME_ROOM.idFromName(roomId))
+      const res = await stub.fetch(
+        new Request("https://room.internal/expect", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            slots: [
+              { guestId: match.host.guestId, token: slots.host, role: "host" },
+              { guestId: match.guest.guestId, token: slots.guest, role: "guest" },
+            ],
+          }),
+        }),
+      )
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
   private async handlePoll(game: string, ticket: string): Promise<Response> {
     const matches = await this.getMatches()
     const match = matches[ticket]
     if (match) {
-      return jsonResponse({ status: "matched", match })
+      // Records persisted before the slot-capability deploy carry no `slots`
+      // — treat them as open-mode (the room was never allocated) rather than
+      // stalling them behind a binding that can never exist.
+      if (match.slots && match.slotsBound !== true) {
+        const bound = await this.bindRoomSlots(match.roomId, match, match.slots)
+        if (!bound) {
+          return jsonResponse({ status: "waiting", ticket, roomId: match.roomId })
+        }
+        const state = await this.loadState()
+        const stored = state.matches[ticket]
+        if (stored) {
+          stored.slotsBound = true
+          await this.saveState(state)
+        }
+      }
+      const { slots, slotsBound, ...pub } = match
+      return jsonResponse({
+        status: "matched",
+        match: pub,
+        ...(slots ? { slotToken: slots[match.role] } : {}),
+      })
     }
 
     const now = Date.now()
