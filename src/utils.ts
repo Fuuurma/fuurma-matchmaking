@@ -65,12 +65,19 @@ export function sanitizeDisplayName(value: string | undefined | null): string {
   return safe.length >= 2 ? safe : "Guest"
 }
 
-/** CORS headers applied to all JSON responses. */
+/**
+ * CORS + baseline security headers applied to all JSON responses.
+ * CSP is the API shape (`default-src 'none'` — the Worker serves JSON and
+ * WebSocket, never a document) plus `frame-ancestors 'none'`; `nosniff`
+ * stops content-type sniffing of the JSON bodies.
+ */
 export function corsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
     "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
   }
 }
