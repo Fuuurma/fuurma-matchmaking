@@ -423,4 +423,14 @@ describe("MatchmakingQueues via worker fetch", () => {
       expect(response.status).toBe(426)
     }
   })
+
+  it("carries security headers on JSON API responses", async () => {
+    const response = await health("tictactoe")
+    expect(response.status).toBe(200)
+    expect(response.headers.get("Content-Security-Policy")).toBe(
+      "default-src 'none'; frame-ancestors 'none'",
+    )
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff")
+    expect(response.headers.get("Strict-Transport-Security")).toContain("max-age=")
+  })
 })
