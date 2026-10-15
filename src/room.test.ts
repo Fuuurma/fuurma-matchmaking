@@ -992,17 +992,54 @@ describe("GameRoomDO", () => {
     guest.close()
   })
 
-  it("frees an allocated guestId squatted before the allocation arrived (F20)", async () => {
-    const rid = roomId("squatalloc")
+  it("promotes the ticket-holder's own early seat instead of evicting it (F20)", async () => {
+    const rid = roomId("earlyseat")
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
 
-    // The waiter knows BOTH the future roomId (from waiting responses) and
-    // its own allocated guestId — it chose the id at join. Squatting the id
-    // pre-allocation used to lock the real owner out: the seat persisted,
-    // and their hello fell into the reconnect path demanding a credential
-    // only the squatter holds.
+    // tic-tac-toe hosts its relay room while searching: the waiting player
+    // sits under its OWN guestId before the allocation exists. That seat is
+    // provably the ticket-holder's — only they know (roomId, guestId) before
+    // the push, since matchmaking withholds `matched` until /expect lands —
+    // so /expect binds it rather than evicting it. Evicting it tore a seat
+    // window where the matched peer's first frames fan out to zero sockets
+    // and the pair deadlocks on "Waiting for opponent".
+    const early = await openSocket(rid)
+    send(early, { type: "hello", guestId: "h1", displayName: "H", role: "host" })
+    const earlyWelcome = JSON.parse(await nextMessage(early, 1000, "early welcome"))
+    expect(earlyWelcome.type).toBe("welcome")
+
+    const resp = await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    expect(resp.status).toBe(200)
+
+    // The early seat survived, token-bound, and its socket was never closed.
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h1"])
+    expect(early.readyState).toBe(WebSocket.OPEN)
+
+    // The matched peer seats through the token and reaches the held seat —
+    // peer-joined lands on the still-open socket, no transition gap.
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    const guestWelcome = JSON.parse(await nextMessage(guest, 1000, "guest welcome"))
+    expect(guestWelcome).toMatchObject({ type: "welcome", role: "guest" })
+    expect(guestWelcome.opponent?.guestId).toBe("h1")
+    const joined = JSON.parse(await nextMessage(early, 1000, "peer-joined on early seat"))
+    expect(joined).toMatchObject({ type: "peer-joined" })
+
+    early.close()
+    guest.close()
+  })
+
+  it("still evicts a pre-allocation seat that fails the role check (F20)", async () => {
+    const rid = roomId("earlyrole")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    // Promotion requires the allocation's role too — a seat under the right
+    // guestId but a different role is not the ticket-holder's hold.
     const squatter = await openSocket(rid)
-    send(squatter, { type: "hello", guestId: "h1", displayName: "S", role: "host" })
+    send(squatter, { type: "hello", guestId: "h1", displayName: "S", role: "guest" })
     expect(JSON.parse(await nextMessage(squatter, 1000, "squatter welcome")).type).toBe("welcome")
 
     const resp = await pushExpect(stub, [
@@ -1011,13 +1048,44 @@ describe("GameRoomDO", () => {
     ])
     expect(resp.status).toBe(200)
     expect((await readSlots(stub)).map((s) => s.guestId)).toEqual([])
+    expect(squatter.readyState).not.toBe(WebSocket.OPEN)
 
-    const real = await openSocket(rid)
-    send(real, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
-    const welcome = JSON.parse(await nextMessage(real, 1000, "real owner welcome"))
-    expect(welcome).toMatchObject({ type: "welcome", role: "host" })
+    squatter.close()
+  })
 
-    real.close()
+  it("does not promote a seat under a guestId the push already knew (F20)", async () => {
+    const rid = roomId("noremote")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const slots = [
+      { guestId: "h1", token: "tokH", role: "host" as const },
+      { guestId: "g1", token: "tokG", role: "guest" as const },
+    ]
+
+    // After the first push, `matched` has disclosed roomId + guestIds — a
+    // non-token seat under an allocated id can now be a genuine squat, so a
+    // re-push must evict rather than promote it.
+    expect((await pushExpect(stub, slots)).status).toBe(200)
+    const squatter = await openSocket(rid)
+    send(squatter, {
+      type: "hello",
+      guestId: "h1",
+      displayName: "S",
+      role: "host",
+      slotToken: "wrong",
+    })
+    expect(JSON.parse(await nextMessage(squatter, 1000, "squatter refused")).type).toBe("error")
+    squatter.close()
+
+    // A second hello path that bypasses the token (open-claim) cannot exist
+    // while expected is armed, so simulate the seat directly: the filter on
+    // re-push must still remove non-viaExpect rows.
+    await runInDurableObject(stub, async (_state, state2) => {
+      await state2.storage.put("slots", [
+        { guestId: "h1", role: "host", displayName: "S", disconnectedAt: null },
+      ])
+    })
+    expect((await pushExpect(stub, slots)).status).toBe(200)
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual([])
   })
 
   it("keeps token-seated slots across an idempotent /expect re-push", async () => {

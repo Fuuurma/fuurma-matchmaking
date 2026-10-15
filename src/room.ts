@@ -438,19 +438,28 @@ export class GameRoomDO extends DurableObject {
       parsed[e.guestId] = { token: e.token, role: e.role }
     }
     const state = await this.loadState()
-    state.expected = { ...(state.expected ?? {}), ...parsed }
+    const prior = state.expected ?? {}
+    state.expected = { ...prior, ...parsed }
 
-    // Evict every seat that was not minted through a token under this
-    // allocation (F20). Matchmaking withholds the match response until this
-    // push lands, yet a queued player learns the future roomId — and its own
-    // allocated guestId — from waiting responses while the room is still
-    // open-claim, so seats can exist that no token ever bound. Left in place
-    // they dead-on-arrival the match (room full) or lock the real owner
-    // behind a reconnectToken only the squatter received. A retry re-push
-    // keeps seats that ARE token-bound, preserving idempotence.
+    // A pre-allocation seat under a guestId this push just minted — with the
+    // allocated role — is the ticket-holder's own early hold (F20): `matched`
+    // is withheld until this push lands, so nobody else can know the roomId,
+    // and only the holder chose that guestId. Promote it in place instead of
+    // evicting it — eviction tore a seat window where the matched peer's
+    // first frames fanned out to zero sockets and the pair deadlocked
+    // waiting for each other. Entries already in `prior` were disclosed by
+    // an earlier push, so a seat under them gets no benefit of the doubt.
+    // Every other seat not minted through a token is a squatter (F20):
+    // evict it, and tell nobody — it was never a peer of record, and
+    // announcing its departure only poisoned real seats (terminal forfeit).
     const evicted = new Set<string>()
     state.slots = state.slots.filter((slot) => {
       if (slot.viaExpect === true && state.expected?.[slot.guestId]) return true
+      const minted = prior[slot.guestId] === undefined ? parsed[slot.guestId] : undefined
+      if (minted && minted.role === slot.role) {
+        slot.viaExpect = true
+        return true
+      }
       evicted.add(slot.guestId)
       return false
     })
@@ -465,8 +474,6 @@ export class GameRoomDO extends DurableObject {
           } catch {
             // already closing
           }
-        } else {
-          this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "expired" }))
         }
       }
     }
