@@ -62,7 +62,15 @@ interface Player {
   roomId: string
   displayName: string
   guestId: string
+  /** Last activity — refreshed by polls/rejoins; drives the 30s timeout. */
   joinedAt: number
+  /**
+   * First join — never refreshed. Polling extends `joinedAt` forever, so
+   * without this absolute bound a waiting ticket can live (and grow queue
+   * state) indefinitely (F-new-queue-state-unbounded-2026-10-04). Entries
+   * persisted before this field existed fall back to `joinedAt`.
+   */
+  createdAt?: number
 }
 
 interface QueueState {
@@ -73,9 +81,19 @@ interface QueueState {
 
 const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
+const MAX_TICKET_AGE_MS = 600_000
+const MAX_QUEUE_LENGTH = 100
 const MATCH_TIMEOUT_MS = 300_000
 const JOIN_RATE_WINDOW_MS = 60_000
 const MAX_JOIN_ATTEMPTS_PER_WINDOW = 20
+const MAX_RATE_LIMIT_ENTRIES = 512
+
+/** A queue entry is live while recently polled AND within its absolute age. */
+function isLiveTicket(p: Player, now: number): boolean {
+  return (
+    now - p.joinedAt < QUEUE_TIMEOUT_MS && now - (p.createdAt ?? p.joinedAt) < MAX_TICKET_AGE_MS
+  )
+}
 
 export class MatchmakingQueues extends DurableObject {
   async fetch(request: Request): Promise<Response> {
@@ -151,7 +169,7 @@ export class MatchmakingQueues extends DurableObject {
   private async getQueue(game: string): Promise<Player[]> {
     const state = await this.loadState()
     const now = Date.now()
-    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
+    const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
     if (queue.length !== (state.queues[game] ?? []).length) {
       state.queues[game] = queue
       await this.saveState(state)
@@ -219,7 +237,7 @@ export class MatchmakingQueues extends DurableObject {
     if (rateLimit) return rateLimit
 
     // Prune expired queue entries and matches in one pass.
-    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
+    const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
     for (const ticket of Object.keys(state.matches)) {
       if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
         delete state.matches[ticket]
@@ -236,12 +254,19 @@ export class MatchmakingQueues extends DurableObject {
       displayName: sanitizeDisplayName(req.displayName),
       guestId: req.guestId ?? crypto.randomUUID(),
       joinedAt: now,
+      createdAt: now,
     }
 
     // Guard: one active queue entry per peerId. If the same player re-joins
     // (e.g. lost their ticket and retried), return their existing waiting
     // ticket instead of creating a duplicate queue entry. Refresh joinedAt
     // so the 30s queue timeout resets on each rejoin attempt.
+    if (queue.length >= MAX_QUEUE_LENGTH) {
+      return jsonResponse({ error: "queue full — retry shortly" }, 503, {
+        "Retry-After": "30",
+      })
+    }
+
     const existingEntry = queue.find((p) => p.peerId === player.peerId)
     if (existingEntry) {
       existingEntry.joinedAt = now
@@ -318,6 +343,17 @@ export class MatchmakingQueues extends DurableObject {
     const rateLimits = state.rateLimits ?? {}
     for (const [key, entry] of Object.entries(rateLimits)) {
       if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) delete rateLimits[key]
+    }
+    // Bound the map's high-cardinality tail: past the cap, drop the oldest
+    // windows. Bounded pruning work, and worst case an evicted IP's counter
+    // simply restarts — it does not widen anyone's allowance.
+    const keys = Object.keys(rateLimits)
+    if (keys.length > MAX_RATE_LIMIT_ENTRIES) {
+      const oldestFirst = keys
+        .map((key) => [key, rateLimits[key].windowStartedAt] as const)
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, keys.length - MAX_RATE_LIMIT_ENTRIES)
+      for (const [key] of oldestFirst) delete rateLimits[key]
     }
 
     const current = rateLimits[ip]
@@ -399,7 +435,7 @@ export class MatchmakingQueues extends DurableObject {
 
     const now = Date.now()
     const state = await this.loadState()
-    const queue = (state.queues[game] ?? []).filter((p) => now - p.joinedAt < QUEUE_TIMEOUT_MS)
+    const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
     const player = queue.find((p) => p.ticket === ticket)
     if (!player) {
       return jsonResponse({ error: "ticket not found" }, 404)
@@ -422,9 +458,7 @@ export class MatchmakingQueues extends DurableObject {
     const state = await this.loadState()
 
     const queue = state.queues[game] ?? []
-    const filteredQueue = queue.filter(
-      (p) => now - p.joinedAt < QUEUE_TIMEOUT_MS && p.ticket !== ticket,
-    )
+    const filteredQueue = queue.filter((p) => isLiveTicket(p, now) && p.ticket !== ticket)
     if (filteredQueue.length !== queue.length) {
       state.queues[game] = filteredQueue
     }
