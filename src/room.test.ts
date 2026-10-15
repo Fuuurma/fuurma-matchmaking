@@ -924,4 +924,198 @@ describe("GameRoomDO", () => {
     expect(second).toBe(false)
     host.close()
   })
+
+  // F20. A queued player learns the future roomId from `waiting` responses
+  // while the room is still open-claim, so they can connect and seat
+  // themselves before matchmaking's /expect handoff lands. The merge used to
+  // leave those seats in place: the squatter either dead-on-arrival'd the
+  // match (room full when the allocated players arrived) or sat on an
+  // allocated guestId and forced the real owner through the reconnect path
+  // it cannot satisfy. The contract: an allocation push EVICTS every seat
+  // that was not itself minted through that allocation's token.
+  async function pushExpect(
+    stub: unknown,
+    slots: Array<{ guestId: string; token: string; role: "host" | "guest" }>,
+  ): Promise<Response> {
+    return (stub as { fetch(req: Request): Promise<Response> }).fetch(
+      new Request("https://test.invalid/expect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ slots }),
+      }),
+    )
+  }
+
+  it("evicts an open-claim squatter when the allocation lands (F20)", async () => {
+    const rid = roomId("squatnew")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    // The squatter's window: a waiting response disclosed `rid` while the
+    // room is unallocated, so this hello binds nothing but the id itself.
+    const squatter = await openSocket(rid)
+    send(squatter, { type: "hello", guestId: "squatter", displayName: "S", role: "host" })
+    expect(JSON.parse(await nextMessage(squatter, 1000, "squatter welcome")).type).toBe("welcome")
+
+    const resp = await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    expect(resp.status).toBe(200)
+
+    // The squatted seat must be gone, not just fenced off by the expected map.
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual([])
+
+    // Both allocated players must be able to claim their seats with the token.
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    const hostWelcome = JSON.parse(await nextMessage(host, 1000, "allocated host welcome"))
+    expect(hostWelcome).toMatchObject({ type: "welcome", role: "host" })
+
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    expect(JSON.parse(await nextMessage(guest, 1000, "allocated guest welcome"))).toMatchObject({
+      type: "welcome",
+      role: "guest",
+    })
+
+    host.close()
+    guest.close()
+  })
+
+  it("frees an allocated guestId squatted before the allocation arrived (F20)", async () => {
+    const rid = roomId("squatalloc")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+
+    // The waiter knows BOTH the future roomId (from waiting responses) and
+    // its own allocated guestId — it chose the id at join. Squatting the id
+    // pre-allocation used to lock the real owner out: the seat persisted,
+    // and their hello fell into the reconnect path demanding a credential
+    // only the squatter holds.
+    const squatter = await openSocket(rid)
+    send(squatter, { type: "hello", guestId: "h1", displayName: "S", role: "host" })
+    expect(JSON.parse(await nextMessage(squatter, 1000, "squatter welcome")).type).toBe("welcome")
+
+    const resp = await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    expect(resp.status).toBe(200)
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual([])
+
+    const real = await openSocket(rid)
+    send(real, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    const welcome = JSON.parse(await nextMessage(real, 1000, "real owner welcome"))
+    expect(welcome).toMatchObject({ type: "welcome", role: "host" })
+
+    real.close()
+  })
+
+  it("keeps token-seated slots across an idempotent /expect re-push", async () => {
+    // bindRoomSlots retries the handoff until the match is marked bound; a
+    // re-push must not evict a player who already claimed with its token.
+    const rid = roomId("reexpect")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const slots = [
+      { guestId: "h1", token: "tokH", role: "host" as const },
+      { guestId: "g1", token: "tokG", role: "guest" as const },
+    ]
+
+    expect((await pushExpect(stub, slots)).status).toBe(200)
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    expect(JSON.parse(await nextMessage(host, 1000, "token welcome")).type).toBe("welcome")
+
+    expect((await pushExpect(stub, slots)).status).toBe(200)
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h1"])
+    expect(host.readyState).toBe(WebSocket.OPEN)
+
+    host.close()
+  })
+
+  // F22. Reaping a slot dropped the row but left `state.expected` armed:
+  // when BOTH players' slots died (mutual outage past the 30s grace), the
+  // room kept demanding a slotToken nobody could still present — a refreshed
+  // client persists only reconnectToken — so the room was wedged forever.
+  // The contract: a reap that empties the room retires the allocation; a
+  // reap with a peer still seated keeps it (a slotToken bearer may still
+  // legitimately reclaim, and strangers must stay refused).
+  it("retires the allocation only once every seated slot is reaped (F22)", async () => {
+    const rid = roomId("wedgefix")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host, 1000, "host welcome")
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    await nextMessage(guest, 1000, "guest welcome")
+    await nextMessage(host, 1000, "peer-joined")
+
+    // Guest dies past its grace; host is still seated.
+    guest.close(4000, "reconnecting")
+    await nextMessage(host, 1000, "guest teardown")
+    await runInDurableObject(stub, async (_i, s) => {
+      const stored = (await s.storage.get("room-state")) as {
+        slots: Array<{ guestId: string; disconnectedAt: number | null }>
+      }
+      for (const slot of stored.slots) {
+        if (slot.disconnectedAt !== null) slot.disconnectedAt -= 31_000
+      }
+      await s.storage.put("room-state", stored)
+    })
+    await runDurableObjectAlarm(stub)
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h1"])
+
+    // While the host remains, the allocation is still live: a stranger is
+    // refused, but the reaped player can reclaim with its slotToken.
+    const stranger = await openSocket(rid)
+    send(stranger, { type: "hello", guestId: "c", displayName: "C" })
+    expect(JSON.parse(await nextMessage(stranger, 1000, "stranger refusal"))).toMatchObject({
+      type: "error",
+      code: "invalid",
+    })
+    stranger.close()
+
+    const back = await openSocket(rid)
+    send(back, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    expect(JSON.parse(await nextMessage(back, 1000, "token reclaim"))).toMatchObject({
+      type: "welcome",
+      role: "guest",
+    })
+
+    // Now both die past grace — the match is over for good.
+    back.close(4000, "reconnecting")
+    await nextMessage(host, 1000, "guest teardown 2")
+    host.close(4000, "reconnecting")
+    // Nobody remains to observe a peer-left for the host, so poll storage:
+    // the close handler must have persisted disconnectedAt before the aging
+    // write below, otherwise the slot is reaped on a stale read.
+    for (let i = 0; i < 50; i++) {
+      const hostSlot = (await readSlots(stub)).find((s) => s.guestId === "h1")
+      if (hostSlot?.disconnectedAt !== null && hostSlot?.disconnectedAt !== undefined) break
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    await runInDurableObject(stub, async (_i, s) => {
+      const stored = (await s.storage.get("room-state")) as {
+        slots: Array<{ guestId: string; disconnectedAt: number | null }>
+      }
+      for (const slot of stored.slots) {
+        if (slot.disconnectedAt !== null) slot.disconnectedAt -= 31_000
+      }
+      await s.storage.put("room-state", stored)
+    })
+    await runDurableObjectAlarm(stub)
+    expect(await readSlots(stub)).toEqual([])
+
+    // The dead room reverts to open claim instead of fossilizing behind an
+    // expectation nobody can satisfy.
+    const fresh = await openSocket(rid)
+    send(fresh, { type: "hello", guestId: "late", displayName: "L" })
+    expect(JSON.parse(await nextMessage(fresh, 1000, "post-wedge welcome")).type).toBe("welcome")
+    fresh.close()
+  })
 })

@@ -105,6 +105,15 @@ interface Slot {
    * claimant retires the identity instead (see handleHello).
    */
   reconnectToken: string
+  /**
+   * True when the slot was minted through the room's `expected` allocation —
+   * the caller presented the matching slotToken. This is what lets the
+   * /expect merge tell a token-bound seat from an open-claim holdover that
+   * merely squatted an allocated guestId: only the former survives the
+   * merge (F20). Absent on seats claimed before any allocation landed and on
+   * slots persisted before this field existed.
+   */
+  viaExpect?: boolean
 }
 
 /** 128 bits of randomness, hex-encoded — the per-slot reconnect credential. */
@@ -354,6 +363,17 @@ export class GameRoomDO extends DurableObject {
       return false
     })
 
+    // A reap that empties the room retires the allocation (F22): with nobody
+    // seated the match is dead, and an armed `expected` would keep demanding
+    // slotTokens nobody can still present — a refreshed client persists only
+    // its reconnectToken — so the room would refuse every hello forever.
+    // While a peer is still seated the map stays armed: a slotToken bearer
+    // may still legitimately reclaim its reaped seat, and strangers must
+    // keep being refused.
+    if (removedGuestIds.length > 0 && state.slots.length === 0 && state.expected) {
+      delete state.expected
+    }
+
     if (changed) await this.saveState(state)
 
     // The next wake-up is the earliest REAL deadline still outstanding: a
@@ -419,7 +439,37 @@ export class GameRoomDO extends DurableObject {
     }
     const state = await this.loadState()
     state.expected = { ...(state.expected ?? {}), ...parsed }
+
+    // Evict every seat that was not minted through a token under this
+    // allocation (F20). Matchmaking withholds the match response until this
+    // push lands, yet a queued player learns the future roomId — and its own
+    // allocated guestId — from waiting responses while the room is still
+    // open-claim, so seats can exist that no token ever bound. Left in place
+    // they dead-on-arrival the match (room full) or lock the real owner
+    // behind a reconnectToken only the squatter received. A retry re-push
+    // keeps seats that ARE token-bound, preserving idempotence.
+    const evicted = new Set<string>()
+    state.slots = state.slots.filter((slot) => {
+      if (slot.viaExpect === true && state.expected?.[slot.guestId]) return true
+      evicted.add(slot.guestId)
+      return false
+    })
     await this.saveState(state)
+
+    if (evicted.size > 0) {
+      for (const ws of this.ctx.getWebSockets()) {
+        const att = ws.deserializeAttachment() as RoomAttachment | null
+        if (att && !isPendingConnection(att) && evicted.has(att.guestId)) {
+          try {
+            ws.close(1008, "seat superseded by allocation")
+          } catch {
+            // already closing
+          }
+        } else {
+          this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "expired" }))
+        }
+      }
+    }
     return jsonResponse({ ok: true })
   }
 
@@ -561,6 +611,10 @@ export class GameRoomDO extends DurableObject {
         role,
         disconnectedAt: null,
         reconnectToken: generateReconnectToken(),
+        // Reaching this point while an allocation is armed means the
+        // slotToken check above passed — the seat is token-bound and
+        // survives an /expect merge eviction (F20).
+        viaExpect: state.expected !== undefined,
       }
       state.slots.push(slot)
     }
