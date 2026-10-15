@@ -249,6 +249,16 @@ describe("GameRoomDO", () => {
     expect(welcome.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
     victim.close()
 
+    // webSocketClose runs async in the DO; if it lands after the attacker's
+    // hello, the victim's peer-left broadcast reaches the attacker before the
+    // error reply and the test flakes. Wait for the disconnect to persist.
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    for (let i = 0; i < 20; i++) {
+      const slots = await readSlots(stub)
+      if (slots.some((s) => s.guestId === "victim" && s.disconnectedAt !== null)) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+
     // Attacker knows roomId + victim guestId (both public) but no credential.
     const attacker = await openSocket(rid)
     send(attacker, { type: "hello", guestId: "victim", displayName: "Evil" })
