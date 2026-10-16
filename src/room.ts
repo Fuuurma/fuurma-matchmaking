@@ -29,6 +29,13 @@ import {
 
 const RECONNECT_GRACE_MS = 30_000
 const HELLO_TIMEOUT_MS = 10_000
+/**
+ * How long a matchmade allocation waits for its seat to be filled. The
+ * client connects immediately after `matched` lands, so 60s already covers
+ * slow networks and tab resume; beyond that the allocated player is never
+ * coming and the seated peer must be released instead of waiting forever.
+ */
+const EXPECTED_SEAT_DEADLINE_MS = 60_000
 
 /**
  * Earliest reconnect-grace deadline still outstanding across `slots`.
@@ -51,6 +58,30 @@ function earliestSlotDeadline(slots: ReadonlyArray<Slot>, now: number): number |
   return earliest
 }
 const MAX_SLOTS = 2
+
+/**
+ * Earliest seat-fill deadline across expected entries nobody claimed. An
+ * entry counts as claimed once a slot exists for its guestId minted through
+ * the allocation (`viaExpect`): while that seat lives, the reconnect-grace
+ * reap — not this deadline — owns the expiry. Entries without `armedAt`
+ * (persisted before the deadline existed) get a full window from `now`, so
+ * the first alarm after a deploy cannot kill a match in flight.
+ */
+function earliestExpectedDeadline(
+  expected: RoomState["expected"],
+  slots: ReadonlyArray<Slot>,
+  now: number,
+): number | null {
+  if (!expected) return null
+  const claimed = new Set(slots.filter((s) => s.viaExpect === true).map((s) => s.guestId))
+  let earliest: number | null = null
+  for (const [guestId, entry] of Object.entries(expected)) {
+    if (claimed.has(guestId)) continue
+    const deadline = (entry.armedAt ?? now) + EXPECTED_SEAT_DEADLINE_MS
+    if (earliest === null || deadline < earliest) earliest = deadline
+  }
+  return earliest
+}
 
 /**
  * Message types owned by the room server. These are never relayed
@@ -134,7 +165,19 @@ interface RoomState {
    * never received an allocation (invite links, direct room joins) keep
    * open guestId-claim semantics.
    */
-  expected?: Record<string, { token: string; role: "host" | "guest" }>
+  expected?: Record<
+    string,
+    {
+      token: string
+      role: "host" | "guest"
+      /**
+       * When the allocation armed this seat capability. Missing on entries
+       * persisted before the seat deadline existed — the alarm backfills it
+       * on first sight so a deploy cannot kill a match in flight.
+       */
+      armedAt?: number
+    }
+  >
 }
 
 interface ConnectionAttachment {
@@ -374,6 +417,30 @@ export class GameRoomDO extends DurableObject {
       delete state.expected
     }
 
+    // A matchmade seat that never fills is a player who never arrives: the
+    // allocated peer's first connect failed or never ran, and nothing else
+    // bounds the seated peer's wait (the ticket's poll already finished).
+    // Expire the entry once its own armedAt deadline elapses; missing
+    // armedAt backfills to now so the reap reaches pre-deadline allocations
+    // one window later instead of at deploy time.
+    let expectedExpired = false
+    if (state.expected) {
+      const claimed = new Set(state.slots.filter((s) => s.viaExpect === true).map((s) => s.guestId))
+      for (const [guestId, entry] of Object.entries(state.expected)) {
+        if (claimed.has(guestId)) continue
+        if (entry.armedAt === undefined) {
+          entry.armedAt = now
+          changed = true
+          continue
+        }
+        if (entry.armedAt + EXPECTED_SEAT_DEADLINE_MS > now) continue
+        delete state.expected[guestId]
+        expectedExpired = true
+        changed = true
+      }
+      if (Object.keys(state.expected).length === 0) delete state.expected
+    }
+
     if (changed) await this.saveState(state)
 
     // The next wake-up is the earliest REAL deadline still outstanding: a
@@ -381,12 +448,10 @@ export class GameRoomDO extends DurableObject {
     // as `now + RECONNECT_GRACE_MS` on every wake-up pushed each slot's
     // deadline further out every time the alarm fired for anything else.
     const nextSlotDeadline = earliestSlotDeadline(state.slots, now)
-    const nextAlarm =
-      nextPendingDeadline === null
-        ? nextSlotDeadline
-        : nextSlotDeadline === null
-          ? nextPendingDeadline
-          : Math.min(nextPendingDeadline, nextSlotDeadline)
+    const nextExpectedDeadline = earliestExpectedDeadline(state.expected, state.slots, now)
+    const nextAlarm = [nextPendingDeadline, nextSlotDeadline, nextExpectedDeadline]
+      .filter((d): d is number => d !== null)
+      .reduce<number | null>((min, d) => (min === null || d < min ? d : min), null)
     if (nextAlarm === null) {
       await this.ctx.storage.deleteAlarm()
     } else {
@@ -396,8 +461,10 @@ export class GameRoomDO extends DurableObject {
     if (!changed) return
 
     // Only broadcast peer-left if a slot was actually removed (not
-    // when a peer reconnected within the grace period).
-    if (removedGuestIds.length > 0) {
+    // when a peer reconnected within the grace period) or a matchmade seat
+    // expired unfilled — the seated peer's match is dead either way, and
+    // clients treat `expired` as the terminal room-dead signal.
+    if (removedGuestIds.length > 0 || (expectedExpired && state.slots.length > 0)) {
       for (const ws of sockets) {
         this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "expired" }))
       }
@@ -422,7 +489,8 @@ export class GameRoomDO extends DurableObject {
     if (!Array.isArray(slots) || slots.length < 1 || slots.length > MAX_SLOTS) {
       return jsonResponse({ error: "slots must be a 1-2 entry array" }, 400)
     }
-    const parsed: Record<string, { token: string; role: "host" | "guest" }> = {}
+    const armedAt = Date.now()
+    const parsed: Record<string, { token: string; role: "host" | "guest"; armedAt: number }> = {}
     for (const s of slots) {
       const e = s as { guestId?: unknown; token?: unknown; role?: unknown }
       if (
@@ -435,7 +503,7 @@ export class GameRoomDO extends DurableObject {
       ) {
         return jsonResponse({ error: "each slot needs guestId, token, role" }, 400)
       }
-      parsed[e.guestId] = { token: e.token, role: e.role }
+      parsed[e.guestId] = { token: e.token, role: e.role, armedAt }
     }
     const state = await this.loadState()
     const prior = state.expected ?? {}
@@ -477,6 +545,10 @@ export class GameRoomDO extends DurableObject {
         }
       }
     }
+    // An armed allocation needs its own wake-up: with zero sockets there are
+    // no pending-handshake or slot deadlines, so nothing else ever schedules
+    // the alarm that reaps a seat nobody claims.
+    await this.scheduleRoomAlarm(state)
     return jsonResponse({ ok: true })
   }
 
@@ -714,6 +786,12 @@ export class GameRoomDO extends DurableObject {
     // handler. Re-arming from `now` on every close pushed a slot's real
     // expiry outwards each time anything else touched the alarm.
     let nextAlarm = earliestSlotDeadline(state.slots, now)
+
+    const nextExpectedDeadline = earliestExpectedDeadline(state.expected, state.slots, now)
+    if (nextExpectedDeadline !== null) {
+      nextAlarm =
+        nextAlarm === null ? nextExpectedDeadline : Math.min(nextAlarm, nextExpectedDeadline)
+    }
 
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as RoomAttachment | null

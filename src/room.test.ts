@@ -1196,4 +1196,131 @@ describe("GameRoomDO", () => {
     expect(JSON.parse(await nextMessage(fresh, 1000, "post-wedge welcome")).type).toBe("welcome")
     fresh.close()
   })
+
+  // Never-seated seats. Before this, an `expected` entry had no deadline:
+  // a host whose first connect failed left its allocated guest on
+  // "Waiting for host…" forever, and a guest that never joined parked the
+  // host the same way — the reap only looked at seated slots, and with zero
+  // connected sockets nothing armed the alarm at all. The contract: each
+  // allocation entry carries its own seat-fill deadline; the alarm expires
+  // an unclaimed one and releases the waiting peer with `peer-left expired`.
+  async function ageExpectedEntries(
+    stub: unknown,
+    guestIds: string[],
+    agedByMs: number,
+  ): Promise<void> {
+    await runInDurableObject(stub as never, async (_i: unknown, s: DurableObjectState) => {
+      const stored = (await s.storage.get("room-state")) as {
+        expected?: Record<string, { armedAt?: number }>
+      }
+      if (!stored.expected) return
+      for (const id of guestIds) {
+        const entry = stored.expected[id]
+        if (entry) entry.armedAt = (entry.armedAt ?? Date.now()) - agedByMs
+      }
+      await s.storage.put("room-state", stored)
+    })
+  }
+
+  it("arms the seat deadline when an allocation lands on an empty room", async () => {
+    const rid = roomId("armedseat")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    expect(await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())).not.toBeNull()
+  })
+
+  it("expires the seat an allocated peer never claims and releases the waiter", async () => {
+    const rid = roomId("neverhere")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    expect(JSON.parse(await nextMessage(host, 1000, "host welcome")).type).toBe("welcome")
+
+    // The allocated guest never connects. Age its entry past the deadline.
+    // The listener attaches before the alarm: frames are not buffered for
+    // late listeners in this pool.
+    const peerLeft = nextMessage(host, 2000, "peer-left")
+    await ageExpectedEntries(stub, ["g1"], 61_000)
+    await runDurableObjectAlarm(stub)
+
+    expect(JSON.parse(await peerLeft)).toMatchObject({
+      type: "peer-left",
+      reason: "expired",
+    })
+
+    // g1's capability is gone — a late claim arrives to open-claim refusal…
+    const stored = await runInDurableObject(stub, async (_i, s) => {
+      return (await s.storage.get("room-state")) as {
+        expected?: Record<string, unknown>
+      }
+    })
+    // …while the seated host's own claimed entry stays armed.
+    expect(Object.keys(stored.expected ?? {})).toEqual(["h1"])
+
+    host.close()
+  })
+
+  it("retires a fully absent allocation with nobody to notify", async () => {
+    const rid = roomId("allabsent")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    await ageExpectedEntries(stub, ["h1", "g1"], 61_000)
+    await runDurableObjectAlarm(stub)
+
+    const stored = await runInDurableObject(stub, async (_i, s) => {
+      return (await s.storage.get("room-state")) as {
+        expected?: Record<string, unknown>
+      }
+    })
+    expect(stored.expected).toBeUndefined()
+    // Inert room: no outstanding deadline means no alarm stays armed.
+    expect(await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())).toBeNull()
+
+    // And a latecomer lands on the reverted open-claim room.
+    const late = await openSocket(rid)
+    send(late, { type: "hello", guestId: "late", displayName: "L" })
+    expect(JSON.parse(await nextMessage(late, 1000, "late welcome")).type).toBe("welcome")
+    late.close()
+  })
+
+  it("keeps both seats when the allocated pair claims them in time", async () => {
+    const rid = roomId("bothclaim")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await pushExpect(stub, [
+      { guestId: "h1", token: "tokH", role: "host" },
+      { guestId: "g1", token: "tokG", role: "guest" },
+    ])
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host, 1000, "host welcome")
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    await nextMessage(guest, 1000, "guest welcome")
+    await nextMessage(host, 1000, "peer-joined")
+
+    // Even a stale-armed entry is safe once its seat exists: the reap only
+    // looks at entries nobody claimed. Listeners attach before the alarm so
+    // a wrongly-sent frame cannot slip past unobserved.
+    const noHost = expectNoMessage(host, "no peer-left with both seats filled")
+    const noGuest = expectNoMessage(guest, "no peer-left with both seats filled")
+    await ageExpectedEntries(stub, ["h1", "g1"], 61_000)
+    await runDurableObjectAlarm(stub)
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h1", "g1"])
+    await noHost
+    await noGuest
+
+    host.close()
+    guest.close()
+  })
 })
