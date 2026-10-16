@@ -25,6 +25,7 @@ Operational rules:
 - After reading the hub pointers, keep reading this file's repo-local instructions; they are the authority for this codebase.
 - Use `pnpm@10.30.2` unless this repo explicitly documents a different toolchain.
 - When you learn a reusable pattern, fix, or project-state change, update `~/Projects/hub` so the next agent starts stronger.
+- Reports to Furma are <=4 lines: **Point** (outcome + artifact), **Matters** (only his action/blocker, else omit), **Next** (one proposal). Detail lives in WORK.md/LEDGER.md - no narration.
 
 ### Agent skills and generated guidance
 
