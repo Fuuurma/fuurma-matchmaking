@@ -52,7 +52,7 @@ For Better Auth, follow `AUTH-OAUTH.md` exactly.
 
 # fuurma-matchmaking — Agent entrypoint
 
-Shared Cloudflare Worker for quick matchmaking and WebSocket room relay for the Fuurma games (`tic-tac-toe` and `uno-chess`).
+Shared Cloudflare Worker for quick matchmaking and WebSocket room relay for the Fuurma games (`tictactoe` and `gambit-deck`).
 
 ## Stack
 
@@ -94,10 +94,10 @@ pnpm run check           # tsc --noEmit
 - `GET /api/matchmaking/{game}/health` — queue health
 - `GET /room/{roomId}` — WebSocket upgrade to `GameRoomDO`
 
-Local default: `http://127.0.0.1:8787`. `uno-chess` and `tic-tac-toe` assume `127.0.0.1:8787/api/matchmaking/{game}` for local dev.
+Local default: `http://127.0.0.1:8787`. `gambit-deck` and `tictactoe` assume `127.0.0.1:8787/api/matchmaking/{game}` for local dev.
 
 ## Deploy notes
 
 - Durable Object migrations in `wrangler.jsonc` must be applied before `wrangler deploy`.
 - No Convex or auth; the Worker is stateless except for Durable Object storage.
-- Games consume this service; do not change matchmaking room IDs or the `/room/` path without checking `tic-tac-toe` and `uno-chess`.
+- Games consume this service; do not change matchmaking room IDs or the `/room/` path without checking `tictactoe` and `gambit-deck`.

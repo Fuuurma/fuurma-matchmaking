@@ -907,7 +907,7 @@ describe("GameRoomDO", () => {
     const id = env.GAME_ROOM.idFromName(roomId("badschema"))
     const stub = env.GAME_ROOM.get(id)
     const resp = await stub.fetch(
-      new Request("https://test.invalid/?game=crown-chess", {
+      new Request("https://test.invalid/?game=not-a-game", {
         headers: { Upgrade: "websocket" },
       }),
     )
