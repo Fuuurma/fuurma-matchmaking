@@ -280,6 +280,8 @@ describe("MatchmakingQueues via worker fetch", () => {
   })
 
   it("rejects unknown games", async () => {
+    // The card-chess game's retired key is the one that matters here: a client
+    // that still holds it must be refused, not silently queued. Keep the string.
     const response = await join("unochess", "peer-9", "g9", "Alice")
     expect(response.status).toBe(400)
     const body = (await response.json()) as { error: string }
