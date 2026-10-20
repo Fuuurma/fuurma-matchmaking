@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fuurma-matchmaking",
   "main": "src/index.ts",
+  "limits": { "cpu_ms": 50 },
   "compatibility_date": "2026-07-21",
   "compatibility_flags": ["nodejs_compat"],
   "dev": {

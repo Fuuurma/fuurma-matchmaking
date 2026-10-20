@@ -24,7 +24,8 @@ import {
  * role. After the grace expires, an `alarm` cleans up the orphan slot and
  * notifies the remaining peer via `peer-left` with reason `expired`.
  *
- * Spec: ../../hub/migrations/2026-07-games-do-websocket-migration.md
+ * History: the original migration plan (SF `migrations/2026-07-games-do-websocket-migration.md`,
+ * removed 2026-09-10) is superseded by this header — recover it from SF git history if needed.
  */
 
 const RECONNECT_GRACE_MS = 30_000
@@ -439,6 +440,16 @@ export class GameRoomDO extends DurableObject {
         changed = true
       }
       if (Object.keys(state.expected).length === 0) delete state.expected
+    }
+
+    // Fully retired room (storage hygiene): no seated players, no armed
+    // allocations, no live sockets. Delete the persisted state so finished
+    // games don't accumulate SQLite rows forever — loadState rebuilds the
+    // default on next touch, so this is behavior-neutral.
+    if (state.slots.length === 0 && !state.expected && sockets.length === 0) {
+      await this.ctx.storage.delete(ROOM_STATE_KEY)
+      await this.ctx.storage.deleteAlarm()
+      return
     }
 
     if (changed) await this.saveState(state)

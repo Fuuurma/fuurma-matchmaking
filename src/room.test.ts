@@ -191,7 +191,7 @@ describe("GameRoomDO", () => {
 
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
     const response = await stub.fetch(
-      new Request("https://test.invalid/?game=uno-chess", {
+      new Request("https://test.invalid/?game=gambit-deck", {
         headers: { Upgrade: "websocket" },
       }),
     )
@@ -226,6 +226,17 @@ describe("GameRoomDO", () => {
     expect(w1.role).toBe("host")
     expect(w1.reconnectToken).toMatch(/^[0-9a-f]{32}$/)
     first.close()
+
+    // webSocketClose runs async in the DO; if the second hello lands before
+    // the first socket's close is processed, the seat still looks connected
+    // and the welcome carries no role. Wait for the disconnect to persist
+    // (same pattern as the MM-01 test below).
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    for (let i = 0; i < 20; i++) {
+      const slots = await readSlots(stub)
+      if (slots.some((s) => s.guestId === "stable-id" && s.disconnectedAt !== null)) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
 
     const second = await openSocket(rid)
     send(second, {
@@ -437,7 +448,7 @@ describe("GameRoomDO", () => {
   // F395 contract. The peer-left reason is decided by one ternary in
   // room.ts: `code === 1000 && reason === "client closing" ? "closed" :
   // "disconnect"`. "closed" is TERMINAL — the peer durably records a win.
-  // uno-chess's RoomClient.closeForReconnect tears the socket down with
+  // gambit-deck's RoomClient.closeForReconnect tears the socket down with
   // (4000, "reconnecting") precisely so a transient retry lands on the
   // "disconnect" side. Both existing tests close with NO code, so they only
   // ever exercised the implicit branch: inverting the condition — or matching
@@ -453,7 +464,7 @@ describe("GameRoomDO", () => {
     await nextMessage(guest)
     await nextMessage(host) // peer-joined
 
-    // Exactly what uno-chess sends on an automatic retry.
+    // Exactly what gambit-deck sends on an automatic retry.
     guest.close(4000, "reconnecting")
     const evt = JSON.parse(await nextMessage(host))
     expect(evt.type).toBe("peer-left")
@@ -517,7 +528,7 @@ describe("GameRoomDO", () => {
     host.close()
   })
 
-  // F682 / UNO-RECONNECT-01. uno-chess's useOnlineReconnect retries
+  // F682 / UNO-RECONNECT-01. gambit-deck's useOnlineReconnect retries
   // reconnectOnline() on an escalating backoff — 800ms, 1.6s, 3.2s, 6.4s, 8s,
   // 8s plus jitter, so ~6 attempts across ~28-33s against a 30s
   // RECONNECT_GRACE_MS. Roughly half the grace window is spent reconnecting.
@@ -1283,7 +1294,10 @@ describe("GameRoomDO", () => {
         expected?: Record<string, unknown>
       }
     })
-    expect(stored.expected).toBeUndefined()
+    // Retired rooms leave no stored state at all (storage hygiene): the
+    // armed allocation is gone with the key, and loadState rebuilds the
+    // open-claim default on next touch.
+    expect(stored).toBeUndefined()
     // Inert room: no outstanding deadline means no alarm stays armed.
     expect(await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())).toBeNull()
 
@@ -1322,5 +1336,29 @@ describe("GameRoomDO", () => {
 
     host.close()
     guest.close()
+  })
+
+  it("deletes persisted state when the alarm reaps the last seat", async () => {
+    const rid = roomId("retire")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    // One disconnected, long-expired slot; no sockets, no armed allocations.
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.put("room-state", {
+        game: "tictactoe",
+        slots: [{ guestId: "h", displayName: "H", role: "host", disconnectedAt: 1 }],
+      }),
+    )
+    await runInDurableObject(stub, (_instance, state) =>
+      state.storage.setAlarm(Date.now()),
+    )
+    await runDurableObjectAlarm(stub)
+    const persisted = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get("room-state"),
+    )
+    expect(persisted, "retired room leaves no stored state").toBeUndefined()
+    const alarm = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.getAlarm(),
+    )
+    expect(alarm, "no alarm survives a retired room").toBeNull()
   })
 })

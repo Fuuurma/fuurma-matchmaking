@@ -3,7 +3,7 @@
  */
 
 /** Games served by this Worker. Used by both the router and the room DO. */
-export const ALLOWED_GAMES = new Set(["tictactoe", "uno-chess"])
+export const ALLOWED_GAMES = new Set(["tictactoe", "gambit-deck"])
 
 /** Max WebSocket message size (64 KiB — generous for turn-based game moves). */
 export const MAX_MESSAGE_BYTES = 64 * 1024

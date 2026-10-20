@@ -122,7 +122,7 @@ describe("MatchmakingQueues via worker fetch", () => {
     let last: Response | null = null
     for (let i = 0; i < 21; i += 1) {
       last = await worker.fetch(
-        new Request("https://test.invalid/api/matchmaking/uno-chess/join", {
+        new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
           method: "POST",
           body: JSON.stringify({
             peerId: `rate-peer-${i}`,
@@ -444,7 +444,7 @@ describe("MatchmakingQueues via worker fetch", () => {
     // Distinct IPs keep the per-IP join throttle out of the measurement.
     for (let i = 0; i < 100; i += 1) {
       const response = await worker.fetch(
-        new Request("https://test.invalid/api/matchmaking/uno-chess/join", {
+        new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
           method: "POST",
           body: JSON.stringify({
             peerId: `cap-peer-${i}`,
@@ -462,7 +462,7 @@ describe("MatchmakingQueues via worker fetch", () => {
     }
 
     const overflow = await worker.fetch(
-      new Request("https://test.invalid/api/matchmaking/uno-chess/join", {
+      new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
         method: "POST",
         body: JSON.stringify({ peerId: "cap-peer-overflow", guestId: "cap-guest" }),
         headers: {
@@ -478,12 +478,12 @@ describe("MatchmakingQueues via worker fetch", () => {
 
     // The cap entries are real live tickets — drain them so later tests on
     // this game see an empty queue.
-    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("uno-chess"))
+    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
     await runInDurableObject(stub, async (_i, s) => {
       const stored = (await s.storage.get("queue-state")) as {
         queues: Record<string, Array<{ guestId: string }>>
       }
-      stored.queues["uno-chess"] = (stored.queues["uno-chess"] ?? []).filter(
+      stored.queues["gambit-deck"] = (stored.queues["gambit-deck"] ?? []).filter(
         (p) => p.guestId !== "cap-guest",
       )
       await s.storage.put("queue-state", stored)
@@ -521,7 +521,7 @@ describe("MatchmakingQueues via worker fetch", () => {
   })
 
   it("issues a fresh ticket on re-join after the absolute age cap instead of reviving the stale one", async () => {
-    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("uno-chess"))
+    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
     const staleTicket = "b".repeat(32)
     const now = Date.now()
     await runInDurableObject(stub, async (_i, s) => {
@@ -529,8 +529,8 @@ describe("MatchmakingQueues via worker fetch", () => {
         queues: Record<string, unknown[]>
         matches: Record<string, unknown>
       }
-      const queue = stored.queues["uno-chess"] ?? []
-      stored.queues["uno-chess"] = queue
+      const queue = stored.queues["gambit-deck"] ?? []
+      stored.queues["gambit-deck"] = queue
       queue.push({
         ticket: staleTicket,
         peerId: "revive-peer",
@@ -543,7 +543,7 @@ describe("MatchmakingQueues via worker fetch", () => {
       await s.storage.put("queue-state", stored)
     })
 
-    const response = await join("uno-chess", "revive-peer", "revive-guest", "Revive")
+    const response = await join("gambit-deck", "revive-peer", "revive-guest", "Revive")
     const body = (await response.json()) as { status: string; ticket: string }
     expect(body.status).toBe("waiting")
     expect(body.ticket).not.toBe(staleTicket)
