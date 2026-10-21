@@ -1348,17 +1348,13 @@ describe("GameRoomDO", () => {
         slots: [{ guestId: "h", displayName: "H", role: "host", disconnectedAt: 1 }],
       }),
     )
-    await runInDurableObject(stub, (_instance, state) =>
-      state.storage.setAlarm(Date.now()),
-    )
+    await runInDurableObject(stub, (_instance, state) => state.storage.setAlarm(Date.now()))
     await runDurableObjectAlarm(stub)
     const persisted = await runInDurableObject(stub, (_instance, state) =>
       state.storage.get("room-state"),
     )
     expect(persisted, "retired room leaves no stored state").toBeUndefined()
-    const alarm = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.getAlarm(),
-    )
+    const alarm = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())
     expect(alarm, "no alarm survives a retired room").toBeNull()
   })
 })
