@@ -52,10 +52,6 @@ type MatchRecord = MatchWithRole & {
   slotsBound?: boolean
 }
 
-export type MatchmakingResponse =
-  | { status: "waiting"; ticket: string; roomId: string }
-  | { status: "matched"; match: MatchWithRole; slotToken: string }
-
 interface Player {
   ticket: string
   peerId: string
@@ -93,6 +89,22 @@ function isLiveTicket(p: Player, now: number): boolean {
   return (
     now - p.joinedAt < QUEUE_TIMEOUT_MS && now - (p.createdAt ?? p.joinedAt) < MAX_TICKET_AGE_MS
   )
+}
+
+/**
+ * Drop match records whose match window has elapsed. Mutates `state` and
+ * reports whether anything was removed, so the caller decides whether the
+ * pruned state still needs persisting.
+ */
+function pruneExpiredMatches(state: QueueState, now: number): boolean {
+  let changed = false
+  for (const [ticket, match] of Object.entries(state.matches)) {
+    if (now - match.createdAt > MATCH_TIMEOUT_MS) {
+      delete state.matches[ticket]
+      changed = true
+    }
+  }
+  return changed
 }
 
 export class MatchmakingQueues extends DurableObject {
@@ -180,13 +192,7 @@ export class MatchmakingQueues extends DurableObject {
   private async getMatches(): Promise<Record<string, MatchRecord>> {
     const state = await this.loadState()
     const now = Date.now()
-    const before = Object.keys(state.matches).length
-    for (const ticket of Object.keys(state.matches)) {
-      if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
-        delete state.matches[ticket]
-      }
-    }
-    if (Object.keys(state.matches).length !== before) {
+    if (pruneExpiredMatches(state, now)) {
       await this.saveState(state)
     }
     return state.matches
@@ -238,11 +244,7 @@ export class MatchmakingQueues extends DurableObject {
 
     // Prune expired queue entries and matches in one pass.
     const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
-    for (const ticket of Object.keys(state.matches)) {
-      if (now - state.matches[ticket].createdAt > MATCH_TIMEOUT_MS) {
-        delete state.matches[ticket]
-      }
-    }
+    pruneExpiredMatches(state, now)
 
     const ticket = generateTicket()
     const roomId = generateRoomId()
@@ -463,11 +465,7 @@ export class MatchmakingQueues extends DurableObject {
       state.queues[game] = filteredQueue
     }
 
-    for (const t of Object.keys(state.matches)) {
-      if (now - state.matches[t].createdAt > MATCH_TIMEOUT_MS) {
-        delete state.matches[t]
-      }
-    }
+    pruneExpiredMatches(state, now)
 
     const match = state.matches[ticket]
     if (match) {

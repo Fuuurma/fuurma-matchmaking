@@ -181,10 +181,13 @@ interface RoomState {
   >
 }
 
+/**
+ * Socket identity carried across hibernation. Only `guestId` is ever read
+ * back — the authoritative display name and role live in the room's slot
+ * state, which is what the `welcome` / `peer-joined` frames are built from.
+ */
 interface ConnectionAttachment {
   guestId: string
-  displayName: string
-  role: "host" | "guest"
 }
 
 interface PendingConnectionAttachment {
@@ -315,7 +318,7 @@ export class GameRoomDO extends DurableObject {
         }
         // Relay any other well-formed message verbatim to the other peer.
         // Each game owns its own protocol on top of the room envelope.
-        this.fanOut(ws, parsed)
+        this.broadcastExcept(ws, parsed)
       }
     }
   }
@@ -711,11 +714,7 @@ export class GameRoomDO extends DurableObject {
 
     await this.saveState(state)
 
-    ws.serializeAttachment({
-      guestId: slot.guestId,
-      displayName: slot.displayName,
-      role: slot.role,
-    })
+    ws.serializeAttachment({ guestId: slot.guestId })
     await this.scheduleRoomAlarm(state)
 
     const opponent = state.slots.find((s) => s.guestId !== msg.guestId) ?? null
@@ -743,14 +742,6 @@ export class GameRoomDO extends DurableObject {
         type: "peer-reconnected",
         opponent: { guestId: slot.guestId, displayName: slot.displayName },
       })
-    }
-  }
-
-  private fanOut(from: WebSocket, msg: unknown): void {
-    const str = JSON.stringify(msg)
-    for (const ws of this.ctx.getWebSockets()) {
-      if (ws === from) continue
-      this.safeSend(ws, str)
     }
   }
 
