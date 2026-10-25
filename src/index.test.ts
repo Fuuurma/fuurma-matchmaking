@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { env, runInDurableObject } from "cloudflare:test"
-import { beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import worker from "./index"
 
 // Every join gets its own client address unless a test pins one: the DO keeps
@@ -139,6 +139,10 @@ async function allocation(roomId: string) {
 beforeEach(async () => {
   await resetQueue("tictactoe")
   await resetQueue("gambit-deck")
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
 })
 
 describe("MatchmakingQueues via worker fetch", () => {
@@ -862,5 +866,100 @@ describe("matchmaking to room binding", () => {
     bind.release(true)
 
     expect((await pollPending).status).toBe(404)
+  })
+})
+
+type Health = { waiting: number; matches: number; players: number }
+const healthOf = async (game: string) => (await (await health(game)).json()) as Health
+
+describe("match records and health", () => {
+  it("reports one match as one match and two players, not two matches (A-06)", async () => {
+    await join("tictactoe", "hm-host", "hmg-host", "Host")
+    await join("tictactoe", "hm-guest", "hmg-guest", "Guest")
+    expect(await healthOf("tictactoe")).toMatchObject({ waiting: 0, matches: 1, players: 2 })
+
+    await join("tictactoe", "hm-wait", "hmg-wait", "Wait")
+    expect(await healthOf("tictactoe")).toMatchObject({ waiting: 1, matches: 1, players: 3 })
+  })
+
+  it("drops a match record shortly after its ticket collected matched (A-07)", async () => {
+    const start = Date.now()
+    const hostWait = await answer(await join("tictactoe", "gc-host", "gcg-host", "Host"))
+    await join("tictactoe", "gc-guest", "gcg-guest", "Guest")
+    const nowSpy = vi.spyOn(Date, "now")
+
+    nowSpy.mockReturnValue(start + 1_000)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+    // A duplicate poll (a retried request) still gets the same answer...
+    nowSpy.mockReturnValue(start + 5_000)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+    // ...but the tombstone is short, long before the 90 s match window ends.
+    nowSpy.mockReturnValue(start + 30_000)
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(404)
+    expect((await healthOf("tictactoe")).matches).toBe(0)
+  })
+
+  it("expires a match nobody collected after 90 seconds (A-07)", async () => {
+    const start = Date.now()
+    await join("tictactoe", "ex-host", "exg-host", "Host")
+    await join("tictactoe", "ex-guest", "exg-guest", "Guest")
+    const nowSpy = vi.spyOn(Date, "now")
+
+    nowSpy.mockReturnValue(start + 80_000)
+    expect((await healthOf("tictactoe")).matches).toBe(1)
+    nowSpy.mockReturnValue(start + 91_000)
+    expect((await healthOf("tictactoe")).matches).toBe(0)
+  })
+
+  it("caps stored match records, evicting the oldest first (A-07)", async () => {
+    const now = Date.now()
+    const record = (i: number) => ({
+      roomId: `ROOM${i}`.padEnd(32, "0"),
+      role: "host",
+      game: "tictactoe",
+      createdAt: now - 10_000 + i,
+      host: { peerId: `cp-${i}`, displayName: "C", guestId: `cg-${i}` },
+      guest: { peerId: `cq-${i}`, displayName: "C", guestId: `ch-${i}` },
+    })
+    const matches = Object.fromEntries(
+      Array.from({ length: 400 }, (_, i) => [i.toString(16).padStart(32, "0"), record(i)]),
+    )
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", { queues: {}, matches }),
+    )
+
+    const hostWait = await answer(await join("tictactoe", "cap-host", "capg-host", "Host"))
+    await join("tictactoe", "cap-guest", "capg-guest", "Guest")
+
+    expect((await healthOf("tictactoe")).matches).toBeLessThanOrEqual(400)
+    expect((await poll("tictactoe", "0".repeat(32))).status).toBe(404) // oldest evicted
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(200) // newest kept
+  })
+
+  it("keeps join counters in memory, not in the persisted queue state (A-07)", async () => {
+    // A stored blob from an earlier build still carries the counters.
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: {},
+        matches: {},
+        rateLimits: { "198.51.100.1": { count: 1, windowStartedAt: Date.now() } },
+      }),
+    )
+    expect((await join("tictactoe", "rl-peer", "rlg-peer", "Rl")).status).toBe(200)
+    const stored = await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.get("queue-state"),
+    )
+    expect(stored).not.toHaveProperty("rateLimits")
+
+    // Counting still works without it: the 21st join from one address is refused.
+    let last: Response | undefined
+    for (let i = 0; i < 21; i += 1) {
+      last = await join("gambit-deck", `rl2-peer-${i}`, `rl2-guest-${i}`, "Rl", "198.51.100.99")
+    }
+    expect(last?.status).toBe(429)
   })
 })

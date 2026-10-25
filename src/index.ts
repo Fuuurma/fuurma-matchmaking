@@ -50,6 +50,12 @@ type MatchWithRole = Match & { role: "host" | "guest"; game: string; createdAt: 
 type MatchRecord = MatchWithRole & {
   slots?: { host: string; guest: string }
   slotsBound?: boolean
+  /**
+   * When the ticket first collected `matched`. The record then lingers only a
+   * short tombstone (a retried poll still gets its answer) instead of the full
+   * match window (A-06/A-07).
+   */
+  collectedAt?: number
 }
 
 interface Player {
@@ -74,7 +80,8 @@ interface Player {
 interface QueueState {
   queues: Record<string, Player[]>
   matches: Record<string, MatchRecord>
-  rateLimits?: Record<string, { count: number; windowStartedAt: number }>
+  /** Persisted by earlier builds; dropped on load — the counters live in memory now. */
+  rateLimits?: unknown
 }
 
 const QUEUE_KEY = "queue-state"
@@ -82,7 +89,9 @@ const QUEUE_TIMEOUT_MS = 30_000
 const MAX_TICKET_AGE_MS = 600_000
 const MAX_QUEUE_LENGTH = 100
 const MAX_ENTRIES_PER_IP = 3
-const MATCH_TIMEOUT_MS = 300_000
+const MATCH_TIMEOUT_MS = 90_000
+const COLLECTED_MATCH_TTL_MS = 15_000
+const MAX_MATCH_RECORDS = 400
 const JOIN_RATE_WINDOW_MS = 60_000
 const MAX_JOIN_ATTEMPTS_PER_WINDOW = 20
 const MAX_RATE_LIMIT_ENTRIES = 512
@@ -95,14 +104,17 @@ function isLiveTicket(p: Player, now: number): boolean {
 }
 
 /**
- * Drop match records whose match window has elapsed. Mutates `state` and
+ * Drop match records whose match window has elapsed, or whose tombstone has
+ * (a collected record only lingers COLLECTED_MATCH_TTL_MS). Mutates `state` and
  * reports whether anything was removed, so the caller decides whether the
  * pruned state still needs persisting.
  */
 function pruneExpiredMatches(state: QueueState, now: number): boolean {
   let changed = false
   for (const [ticket, match] of Object.entries(state.matches)) {
-    if (now - match.createdAt > MATCH_TIMEOUT_MS) {
+    const tombstoneOver =
+      match.collectedAt !== undefined && now - match.collectedAt > COLLECTED_MATCH_TTL_MS
+    if (tombstoneOver || now - match.createdAt > MATCH_TIMEOUT_MS) {
       delete state.matches[ticket]
       changed = true
     }
@@ -110,7 +122,25 @@ function pruneExpiredMatches(state: QueueState, now: number): boolean {
   return changed
 }
 
+/** Keeps the persisted blob bounded under a burst of matches: oldest records go first. */
+function capMatchRecords(state: QueueState): void {
+  const tickets = Object.keys(state.matches)
+  if (tickets.length <= MAX_MATCH_RECORDS) return
+  tickets.sort((a, b) => state.matches[a].createdAt - state.matches[b].createdAt)
+  for (const ticket of tickets.slice(0, tickets.length - MAX_MATCH_RECORDS)) {
+    delete state.matches[ticket]
+  }
+}
+
 export class MatchmakingQueues extends DurableObject {
+  /**
+   * Join counters per address, in memory only. shortcut: a DO restart (eviction,
+   * deploy) resets them, which only hands out a fresh window; persisting them
+   * rewrote the whole queue blob on every join. Upgrade to a Rate Limiting
+   * binding if the counters must survive restarts.
+   */
+  private joinCounters = new Map<string, { count: number; windowStartedAt: number }>()
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const path = url.pathname
@@ -174,7 +204,9 @@ export class MatchmakingQueues extends DurableObject {
 
   private async loadState(): Promise<QueueState> {
     const stored = await this.ctx.storage.get<QueueState>(QUEUE_KEY)
-    return stored ?? { queues: {}, matches: {} }
+    if (!stored) return { queues: {}, matches: {} }
+    delete stored.rateLimits
+    return stored
   }
 
   private async saveState(state: QueueState): Promise<void> {
@@ -241,9 +273,9 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     const now = Date.now()
-    const state = await this.loadState()
-    const rateLimit = await this.consumeJoinAttempt(state, request, now)
+    const rateLimit = this.consumeJoinAttempt(request, now)
     if (rateLimit) return rateLimit
+    const state = await this.loadState()
 
     const ticket = generateTicket()
     const roomId = generateRoomId()
@@ -311,6 +343,7 @@ export class MatchmakingQueues extends DurableObject {
       const slots = { host: generateTicket(), guest: generateTicket() }
       state.matches[opponent.ticket] = { ...matchWithRole, role: "host", slots }
       state.matches[player.ticket] = { ...matchWithRole, role: "guest", slots }
+      capMatchRecords(state)
       await this.saveState(state)
       const bound = await this.bindRoomSlots(match.roomId, match, slots)
       if (!bound) {
@@ -325,9 +358,8 @@ export class MatchmakingQueues extends DurableObject {
       // saving it would undo their writes (A-01). Re-read and touch only the
       // match records, and only those that still exist.
       const current = await this.loadState()
-      for (const t of [opponent.ticket, player.ticket]) {
-        if (current.matches[t]) current.matches[t].slotsBound = true
-      }
+      const hostRecord = current.matches[opponent.ticket]
+      if (hostRecord) hostRecord.slotsBound = true
       if (!current.matches[player.ticket]) {
         // The host left while the room was binding (F39): honour it. Queue the
         // joiner as a fresh arrival rather than announcing a match with nobody.
@@ -338,6 +370,10 @@ export class MatchmakingQueues extends DurableObject {
         await this.saveState(current)
         return jsonResponse({ status: "waiting", ticket, roomId })
       }
+      // The joiner collects its match in this very response and never learns its
+      // ticket, so nothing can poll that record: drop it now (A-07). The host's
+      // record stays until the host collects.
+      delete current.matches[player.ticket]
       await this.saveState(current)
       return jsonResponse({
         status: "matched",
@@ -351,29 +387,23 @@ export class MatchmakingQueues extends DurableObject {
     return jsonResponse({ status: "waiting", ticket, roomId })
   }
 
-  private async consumeJoinAttempt(
-    state: QueueState,
-    request: Request,
-    now: number,
-  ): Promise<Response | null> {
+  private consumeJoinAttempt(request: Request, now: number): Response | null {
     const ip = clientIp(request)
-    const rateLimits = state.rateLimits ?? {}
-    for (const [key, entry] of Object.entries(rateLimits)) {
-      if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) delete rateLimits[key]
+    const counters = this.joinCounters
+    for (const [key, entry] of counters) {
+      if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) counters.delete(key)
     }
     // Bound the map's high-cardinality tail: past the cap, drop the oldest
     // windows. Bounded pruning work, and worst case an evicted IP's counter
     // simply restarts — it does not widen anyone's allowance.
-    const keys = Object.keys(rateLimits)
-    if (keys.length > MAX_RATE_LIMIT_ENTRIES) {
-      const oldestFirst = keys
-        .map((key) => [key, rateLimits[key].windowStartedAt] as const)
-        .sort((a, b) => a[1] - b[1])
-        .slice(0, keys.length - MAX_RATE_LIMIT_ENTRIES)
-      for (const [key] of oldestFirst) delete rateLimits[key]
+    if (counters.size > MAX_RATE_LIMIT_ENTRIES) {
+      const oldestFirst = [...counters].sort((a, b) => a[1].windowStartedAt - b[1].windowStartedAt)
+      for (const [key] of oldestFirst.slice(0, counters.size - MAX_RATE_LIMIT_ENTRIES)) {
+        counters.delete(key)
+      }
     }
 
-    const current = rateLimits[ip]
+    const current = counters.get(ip)
     if (current && now - current.windowStartedAt < JOIN_RATE_WINDOW_MS) {
       if (current.count >= MAX_JOIN_ATTEMPTS_PER_WINDOW) {
         return jsonResponse({ error: "too many join attempts" }, 429, {
@@ -384,11 +414,8 @@ export class MatchmakingQueues extends DurableObject {
       }
       current.count += 1
     } else {
-      rateLimits[ip] = { count: 1, windowStartedAt: now }
+      counters.set(ip, { count: 1, windowStartedAt: now })
     }
-
-    state.rateLimits = rateLimits
-    await this.saveState(state)
     return null
   }
 
@@ -424,9 +451,12 @@ export class MatchmakingQueues extends DurableObject {
   }
 
   private async handlePoll(game: string, ticket: string): Promise<Response> {
-    const matches = await this.getMatches()
-    const match = matches[ticket]
+    const now = Date.now()
+    let state = await this.loadState()
+    if (pruneExpiredMatches(state, now)) await this.saveState(state)
+    const match = state.matches[ticket]
     if (match) {
+      let dirty = false
       // Records persisted before the slot-capability deploy carry no `slots`
       // — treat them as open-mode (the room was never allocated) rather than
       // stalling them behind a binding that can never exist.
@@ -437,22 +467,27 @@ export class MatchmakingQueues extends DurableObject {
         }
         // Re-read: the bind await let a leave or a prune delete this record,
         // and a match that no longer exists must not be disclosed (A-01).
-        const state = await this.loadState()
-        const stored = state.matches[ticket]
-        if (!stored) return jsonResponse({ error: "ticket not found" }, 404)
-        stored.slotsBound = true
-        await this.saveState(state)
+        state = await this.loadState()
+        if (!state.matches[ticket]) return jsonResponse({ error: "ticket not found" }, 404)
+        state.matches[ticket].slotsBound = true
+        dirty = true
       }
-      const { slots, slotsBound, ...pub } = match
+      const record = state.matches[ticket]
+      // First collection starts the short tombstone: a retried poll still gets
+      // its answer, but the record no longer lingers for the full window (A-07).
+      if (record.collectedAt === undefined) {
+        record.collectedAt = now
+        dirty = true
+      }
+      if (dirty) await this.saveState(state)
+      const { slots, slotsBound, collectedAt, ...pub } = record
       return jsonResponse({
         status: "matched",
         match: pub,
-        ...(slots ? { slotToken: slots[match.role] } : {}),
+        ...(slots ? { slotToken: slots[record.role] } : {}),
       })
     }
 
-    const now = Date.now()
-    const state = await this.loadState()
     const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
     const player = queue.find((p) => p.ticket === ticket)
     if (!player) {
@@ -504,12 +539,18 @@ export class MatchmakingQueues extends DurableObject {
 
   private async handleHealth(game: string): Promise<Response> {
     const queue = await this.getQueue(game)
-    const matches = Object.values(await this.getMatches()).filter((m) => m.game === game)
+    // A match is one room, however many ticket records still reference it.
+    const rooms = new Set(
+      Object.values(await this.getMatches())
+        .filter((m) => m.game === game)
+        .map((m) => m.roomId),
+    )
     return jsonResponse({
       ok: true,
       game,
       waiting: queue.length,
-      matches: matches.length,
+      matches: rooms.size,
+      players: queue.length + 2 * rooms.size,
     })
   }
 }
