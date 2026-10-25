@@ -456,22 +456,46 @@ export class MatchmakingQueues extends DurableObject {
     slots: { host: string; guest: string },
   ): Promise<boolean> {
     try {
-      const stub = this.env.GAME_ROOM.get(this.env.GAME_ROOM.idFromName(roomId))
-      const res = await stub.fetch(
-        new Request("https://room.internal/expect", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            slots: [
-              { guestId: match.host.guestId, token: slots.host, role: "host" },
-              { guestId: match.guest.guestId, token: slots.guest, role: "guest" },
-            ],
-          }),
-        }),
-      )
+      const res = await this.postToRoom(roomId, "expect", {
+        slots: [
+          { guestId: match.host.guestId, token: slots.host, role: "host" },
+          { guestId: match.guest.guestId, token: slots.guest, role: "guest" },
+        ],
+      })
       return res.ok
     } catch {
       return false
+    }
+  }
+
+  /** Internal POST to a room DO. Publicly unreachable: the Worker only forwards GET /room upgrades. */
+  private postToRoom(roomId: string, action: "expect" | "cancel", payload: unknown) {
+    const stub = this.env.GAME_ROOM.get(this.env.GAME_ROOM.idFromName(roomId))
+    return stub.fetch(
+      new Request(`https://room.internal/${action}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    )
+  }
+
+  /**
+   * A matched player cancelled: tell the room so the seated opponent hears
+   * `peer-left closed` now instead of waiting out the 60 s seat deadline (A-13).
+   * Best effort — the leave itself must succeed even if the room is unreachable.
+   * shortcut: only while the leaver's match record exists (<= 90 s, or 15 s
+   * after it collected); a later leave leaves the room to its own deadlines.
+   */
+  private async releaseRoom(match: MatchRecord): Promise<void> {
+    const leaver = match.role === "host" ? match.host.guestId : match.guest.guestId
+    try {
+      await this.postToRoom(match.roomId, "cancel", { guestId: leaver })
+    } catch (err) {
+      logEvent("warn", "room_release_failed", {
+        game: match.game,
+        message: err instanceof Error ? err.message : "unknown",
+      })
     }
   }
 
@@ -561,6 +585,9 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     await this.saveState(state)
+    // After the save, so the room round trip (which opens the input gate) cannot
+    // make this request act on stale state.
+    if (match) await this.releaseRoom(match)
     return jsonResponse({ status: "left" })
   }
 

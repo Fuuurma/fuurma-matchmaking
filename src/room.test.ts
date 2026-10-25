@@ -992,6 +992,51 @@ describe("GameRoomDO", () => {
     )
   }
 
+  it("cancel releases a seated peer, spares the leaver, and leaves no state behind (A-13)", async () => {
+    const rid = roomId("cancel")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const cancel = (body: unknown) =>
+      stub.fetch(
+        new Request("https://test.invalid/cancel", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      )
+
+    expect((await cancel({})).status).toBe(400)
+    expect((await cancel({ guestId: "g1" })).status).toBe(200)
+    expect(await runInDurableObject(stub, (_i, s) => s.storage.get("room-state"))).toBeUndefined()
+
+    expect(
+      (
+        await pushExpect(stub, [
+          { guestId: "h1", token: "tokH", role: "host" },
+          { guestId: "g1", token: "tokG", role: "guest" },
+        ])
+      ).status,
+    ).toBe(200)
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host)
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // g1 cancels: h1 is told the room is closed, g1 is not told about itself.
+    const closed = nextMessage(host)
+    expect((await cancel({ guestId: "g1" })).status).toBe(200)
+    expect(JSON.parse(await closed)).toEqual({ type: "peer-left", reason: "closed" })
+    await expectNoMessage(guest, "the leaver must not be told it left")
+    const stored = (await runInDurableObject(stub, (_i, s) => s.storage.get("room-state"))) as {
+      expected?: unknown
+    }
+    expect(stored.expected).toBeUndefined()
+    host.close()
+    guest.close()
+  })
+
   it("evicts an open-claim squatter when the allocation lands (F20)", async () => {
     const rid = roomId("squatnew")
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))

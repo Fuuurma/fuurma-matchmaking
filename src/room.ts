@@ -220,6 +220,9 @@ export class GameRoomDO extends DurableObject {
     if (request.method === "POST" && url.pathname === "/expect") {
       return this.handleExpect(request)
     }
+    if (request.method === "POST" && url.pathname === "/cancel") {
+      return this.handleCancel(request)
+    }
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade", {
         status: 426,
@@ -563,6 +566,39 @@ export class GameRoomDO extends DurableObject {
     // no pending-handshake or slot deadlines, so nothing else ever schedules
     // the alarm that reaps a seat nobody claims.
     await this.scheduleRoomAlarm(state)
+    return jsonResponse({ ok: true })
+  }
+
+  /**
+   * A matched player cancelled on the matchmaking side (A-13). The match is
+   * dead: retire the allocation and tell every other seated socket the room is
+   * closed, so a peer that already connected stops waiting out the seat
+   * deadline. Same internal-only reach as /expect.
+   */
+  private async handleCancel(request: Request): Promise<Response> {
+    const guestId = ((await request.json().catch(() => null)) as { guestId?: unknown } | null)
+      ?.guestId
+    if (typeof guestId !== "string" || guestId.length < 1 || guestId.length > MAX_GUEST_ID_LENGTH) {
+      return jsonResponse({ error: "guestId required" }, 400)
+    }
+    const state = await this.loadState()
+    const sockets = this.ctx.getWebSockets()
+    if (state.expected) {
+      delete state.expected
+      await this.saveState(state)
+    }
+    for (const ws of sockets) {
+      const att = ws.deserializeAttachment() as RoomAttachment | null
+      if (!att || isPendingConnection(att) || att.guestId === guestId) continue
+      this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "closed" }))
+    }
+    if (state.slots.length === 0 && sockets.length === 0) {
+      // Nothing left to keep: same hygiene as the alarm's fully-retired branch.
+      await this.ctx.storage.delete(ROOM_STATE_KEY)
+      await this.ctx.storage.deleteAlarm()
+    } else {
+      await this.scheduleRoomAlarm(state)
+    }
     return jsonResponse({ ok: true })
   }
 

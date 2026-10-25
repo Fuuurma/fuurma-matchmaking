@@ -110,10 +110,13 @@ function requestInDo(game: string, path: string, init?: RequestInit) {
   })
 }
 
-/** Puts the real room handoff back. */
+/** Puts the real room handoff back (and drops any other replaced room call). */
 async function restoreBind(game: string): Promise<void> {
   await runInDurableObject(queueStub(game), (instance) => {
-    delete (instance as unknown as { bindRoomSlots?: BindFn }).bindRoomSlots
+    // Own properties shadow the prototype methods the tests replace.
+    const overridden = instance as unknown as { bindRoomSlots?: BindFn; postToRoom?: unknown }
+    delete overridden.bindRoomSlots
+    delete overridden.postToRoom
   })
 }
 
@@ -1036,5 +1039,69 @@ describe("pairing freshness", () => {
     expect((joiner.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
       "rs-guest-b",
     )
+  })
+})
+
+describe("leaving a matched ticket releases the room (A-13)", () => {
+  async function openRoomSocket(roomId: string): Promise<WebSocket> {
+    const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
+    const res = await room.fetch(
+      new Request("https://test.invalid/?game=tictactoe", { headers: { Upgrade: "websocket" } }),
+    )
+    const ws = res.webSocket
+    if (!ws) throw new Error(`no websocket, status ${res.status}`)
+    ws.accept()
+    return ws
+  }
+
+  function nextFrame(ws: WebSocket, label: string): Promise<{ type: string; reason?: string }> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label}: no frame within 1 s`)), 1000)
+      ws.addEventListener(
+        "message",
+        (event) => {
+          clearTimeout(timer)
+          resolve(JSON.parse(String(event.data)))
+        },
+        { once: true },
+      )
+    })
+  }
+
+  it("tells the seated opponent the room is closed and retires the allocation", async () => {
+    const host = await answer(await join("tictactoe", "rl-host", "rlg-host", "Host"))
+    const guest = await answer(await join("tictactoe", "rl-guest", "rlg-guest", "Guest"))
+    expect(guest.status).toBe("matched")
+
+    const ws = await openRoomSocket(host.roomId as string)
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        guestId: "rlg-guest",
+        displayName: "G",
+        slotToken: guest.slotToken,
+      }),
+    )
+    expect((await nextFrame(ws, "welcome")).type).toBe("welcome")
+
+    // The host cancels before ever collecting the match.
+    const released = nextFrame(ws, "peer-left")
+    expect((await leave("tictactoe", host.ticket as string)).status).toBe(200)
+    expect(await released).toMatchObject({ type: "peer-left", reason: "closed" })
+    expect(await allocation(host.roomId as string)).toBeUndefined()
+    ws.close()
+  })
+
+  it("still answers the leave when the room cannot be reached", async () => {
+    const host = await answer(await join("tictactoe", "rf-host", "rfg-host", "Host"))
+    await join("tictactoe", "rf-guest", "rfg-guest", "Guest")
+    await runInDurableObject(queueStub("tictactoe"), (instance) => {
+      ;(instance as unknown as { postToRoom: () => never }).postToRoom = () => {
+        throw new Error("room unreachable")
+      }
+    })
+    const res = await leave("tictactoe", host.ticket as string)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { status: string }).status).toBe("left")
   })
 })
