@@ -724,8 +724,18 @@ export class GameRoomDO extends DurableObject {
 
       let role: "host" | "guest" =
         expected?.role ?? requestedRole ?? (state.slots.length === 0 ? "host" : "guest")
-      // If the requested role is already taken, fall back to the other one.
       const takenRoles = new Set(state.slots.map((s) => s.role))
+      // A caller that NAMED a role in an open room wants exactly that seat. Seating
+      // it as the other role announced a stranger to the real holder and ended the
+      // room when the "guest" left, so refuse before welcome (and before any
+      // peer-joined). An allocated room is decided by the slotToken, not the hint;
+      // a hello naming no role keeps first-come seating below.
+      if (!expected && requestedRole && takenRoles.has(requestedRole)) {
+        this.sendError(ws, "role-taken", "That room code is already in use")
+        ws.close(1008, "role taken")
+        return
+      }
+      // No role named: if first-come lands on a taken seat, take the other one.
       if (takenRoles.has(role)) {
         role = role === "host" ? "guest" : "host"
       }
