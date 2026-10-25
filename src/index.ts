@@ -318,9 +318,25 @@ export class MatchmakingQueues extends DurableObject {
         // reopen the pre-claim hole this commit exists to close.
         return jsonResponse({ status: "waiting", ticket, roomId })
       }
-      state.matches[opponent.ticket].slotsBound = true
-      state.matches[player.ticket].slotsBound = true
-      await this.saveState(state)
+      // The bind await opened the input gate: polls, leaves and other joins ran
+      // against storage while this request waited, so `state` is stale and
+      // saving it would undo their writes (A-01). Re-read and touch only the
+      // match records, and only those that still exist.
+      const current = await this.loadState()
+      for (const t of [opponent.ticket, player.ticket]) {
+        if (current.matches[t]) current.matches[t].slotsBound = true
+      }
+      if (!current.matches[player.ticket]) {
+        // The host left while the room was binding (F39): honour it. Queue the
+        // joiner as a fresh arrival rather than announcing a match with nobody.
+        // shortcut: not re-paired against others queued meanwhile, so it waits
+        // for the next join; upgrade if pairing ever moves off join time.
+        const live = (current.queues[game] ?? []).filter((p) => isLiveTicket(p, Date.now()))
+        current.queues[game] = [...live, player]
+        await this.saveState(current)
+        return jsonResponse({ status: "waiting", ticket, roomId })
+      }
+      await this.saveState(current)
       return jsonResponse({
         status: "matched",
         match: { ...match, role: "guest", game, createdAt: now },
@@ -420,12 +436,13 @@ export class MatchmakingQueues extends DurableObject {
         if (!bound) {
           return jsonResponse({ status: "waiting", ticket, roomId: match.roomId })
         }
+        // Re-read: the bind await let a leave or a prune delete this record,
+        // and a match that no longer exists must not be disclosed (A-01).
         const state = await this.loadState()
         const stored = state.matches[ticket]
-        if (stored) {
-          stored.slotsBound = true
-          await this.saveState(state)
-        }
+        if (!stored) return jsonResponse({ error: "ticket not found" }, 404)
+        stored.slotsBound = true
+        await this.saveState(state)
       }
       const { slots, slotsBound, ...pub } = match
       return jsonResponse({

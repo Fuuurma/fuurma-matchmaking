@@ -756,9 +756,7 @@ describe("matchmaking to room binding", () => {
     expect(text).not.toContain("slotToken")
   })
 
-  // The next three pin the lost-update race across the bind `await` and are
-  // red on the pre-fix handlers (`it.fails`); R1.1 deletes the `.fails`.
-  it.fails("does not lose a third player who queues while a match is binding (A-01)", async () => {
+  it("does not lose a third player who queues while a match is binding (A-01)", async () => {
     const hostWait = await answer(await join("tictactoe", "a1-host", "a1g-host", "Host"))
     const bind = parkedBind()
     await overrideBind("tictactoe", bind.fn)
@@ -784,7 +782,7 @@ describe("matchmaking to room binding", () => {
     )
   })
 
-  it.fails("keeps a leave that lands while the match is binding (F39)", async () => {
+  it("keeps a leave that lands while the match is binding (F39)", async () => {
     const hostWait = await answer(await join("tictactoe", "f39-host", "f39g-host", "Host"))
     const bind = parkedBind()
     await overrideBind("tictactoe", bind.fn)
@@ -807,7 +805,7 @@ describe("matchmaking to room binding", () => {
     expect(((await (await health("tictactoe")).json()) as { matches: number }).matches).toBe(0)
   })
 
-  it.fails("does not answer a poll with a match that was cancelled mid-bind (A-01)", async () => {
+  it("does not answer a poll with a match that was cancelled mid-bind (A-01)", async () => {
     await overrideBind("tictactoe", async () => false)
     const hostWait = await answer(await join("tictactoe", "pm-host", "pmg-host", "Host"))
     const guestWait = await answer(await join("tictactoe", "pm-guest", "pmg-guest", "Guest"))
