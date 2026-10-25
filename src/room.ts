@@ -7,6 +7,7 @@ import {
   MAX_GUEST_ID_LENGTH,
   MAX_MESSAGE_BYTES,
   sanitizeDisplayName,
+  secretsMatch,
   utf8ByteLength,
 } from "./utils"
 
@@ -351,7 +352,9 @@ export class GameRoomDO extends DurableObject {
 
     slot.disconnectedAt = Date.now()
     await this.saveState(state)
-    await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS)
+    // Not a raw setAlarm(now + grace): that pushed an earlier slot's reap (or a
+    // pending hello's 10 s deadline) out to this slot's later deadline (A-14).
+    await this.scheduleRoomAlarm(state)
 
     this.broadcastExcept(ws, {
       type: "peer-left",
@@ -689,7 +692,7 @@ export class GameRoomDO extends DurableObject {
         ws.close(1008, "reconnect rejected")
         return
       }
-      if (presented !== existing.reconnectToken) {
+      if (presented === null || !secretsMatch(presented, existing.reconnectToken)) {
         this.sendError(ws, "invalid", "reconnect credential required")
         ws.close(1008, "reconnect rejected")
         return
@@ -707,7 +710,7 @@ export class GameRoomDO extends DurableObject {
       const expected = state.expected?.[msg.guestId]
       if (state.expected) {
         const presented = typeof msg.slotToken === "string" ? msg.slotToken : null
-        if (!expected || presented !== expected.token) {
+        if (!expected || presented === null || !secretsMatch(presented, expected.token)) {
           this.sendError(ws, "invalid", "join capability required")
           ws.close(1008, "join refused")
           return
@@ -785,6 +788,9 @@ export class GameRoomDO extends DurableObject {
     const str = JSON.stringify(msg)
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === except) continue
+      // A socket that has not said hello is not a player yet (A-15).
+      const att = ws.deserializeAttachment() as RoomAttachment | null
+      if (!att || isPendingConnection(att)) continue
       this.safeSend(ws, str)
     }
   }

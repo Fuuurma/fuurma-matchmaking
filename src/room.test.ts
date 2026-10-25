@@ -772,6 +772,57 @@ describe("GameRoomDO", () => {
     host.close()
   })
 
+  it("keeps the first disconnect's reap deadline when a second slot disconnects later (A-14)", async () => {
+    const rid = roomId("twoclose")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    host.close(1000, "client closing")
+    await nextMessage(guest, 1000, "host peer-left")
+
+    // The host's grace is 20 s in. When the guest drops too, the alarm must stay
+    // at the HOST's remaining 10 s, not move out to a fresh 30 s from now.
+    await runInDurableObject(stub, async (_i, s) => {
+      const stored = (await s.storage.get("room-state")) as {
+        slots: Array<{ guestId: string; disconnectedAt: number | null }>
+      }
+      for (const slot of stored.slots) {
+        if (slot.disconnectedAt !== null) slot.disconnectedAt -= 20_000
+      }
+      await s.storage.put("room-state", stored)
+    })
+    guest.close(1000, "client closing")
+    for (let i = 0; i < 40; i += 1) {
+      if ((await readSlots(stub)).every((slot) => slot.disconnectedAt !== null)) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect((await readSlots(stub)).every((slot) => slot.disconnectedAt !== null)).toBe(true)
+
+    const alarm = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())
+    expect(alarm).not.toBeNull()
+    expect((alarm ?? 0) - Date.now()).toBeLessThan(11_000)
+  })
+
+  it("does not relay frames to a socket that has not said hello (A-15)", async () => {
+    const rid = roomId("pendfan")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+
+    // Connected, no hello yet: not a player, so not an audience.
+    const lurker = await openSocket(rid)
+    send(host, { type: "move", cell: 4 })
+    await expectNoMessage(lurker, "frame relayed to an unauthenticated socket")
+    host.close()
+    lurker.close()
+  })
+
   it("rejects reserved server message types from clients (anti-spoofing)", async () => {
     const rid = roomId("spoof")
     const host = await openSocket(rid)
