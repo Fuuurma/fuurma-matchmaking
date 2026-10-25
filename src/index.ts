@@ -192,7 +192,7 @@ export class MatchmakingQueues extends DurableObject {
         if (!isValidTicket(ticket)) {
           return jsonResponse({ error: "valid ticket required" }, 400)
         }
-        return this.handlePoll(game, ticket)
+        return await this.handlePoll(game, ticket)
       }
 
       if (request.method === "POST" && action === "leave") {
@@ -205,18 +205,19 @@ export class MatchmakingQueues extends DurableObject {
         if (typeof ticket !== "string" || !isValidTicket(ticket)) {
           return jsonResponse({ error: "valid ticket required" }, 400)
         }
-        return this.handleLeave(game, ticket)
+        return await this.handleLeave(game, ticket)
       }
 
       if (request.method === "GET" && action === "health") {
-        return this.handleHealth(game)
+        return await this.handleHealth(game)
       }
 
       return jsonResponse({ error: "not found" }, 404)
     } catch (err) {
-      const message = err instanceof Error ? err.message : "server error"
+      // The cause goes to the log; the client only learns that it failed.
+      const message = err instanceof Error ? err.message : String(err)
       logEvent("error", "matchmaking_request_failed", { game, action, message })
-      return jsonResponse({ error: message }, 500)
+      return jsonResponse({ error: "server error" }, 500)
     }
   }
 
@@ -623,9 +624,11 @@ export default {
       if (!isValidRoomId(roomId)) {
         return jsonResponse({ error: "invalid room id" }, 400)
       }
-      const id = env.GAME_ROOM.idFromName(roomId)
-      const stub = env.GAME_ROOM.get(id)
-      return stub.fetch(request)
+      try {
+        return await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId)).fetch(request)
+      } catch (err) {
+        return unavailable("room", err)
+      }
     }
 
     if (request.method === "OPTIONS") {
@@ -642,9 +645,13 @@ export default {
       return jsonResponse({ error: "unknown game" }, 400)
     }
 
-    const id = env.MATCHMAKING_QUEUES.idFromName(game)
-    const stub = env.MATCHMAKING_QUEUES.get(id)
-    const response = await stub.fetch(request)
+    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+    let response: Response
+    try {
+      response = await stub.fetch(request)
+    } catch (err) {
+      return unavailable("queue", err)
+    }
 
     // Inject wsUrl into matched responses so the client can connect directly.
     const contentType = response.headers.get("Content-Type") ?? ""
@@ -691,6 +698,19 @@ function clientIp(request: Request): string {
     request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
     "unknown"
   )
+}
+
+/**
+ * A Durable Object that is overloaded or resetting makes `stub.fetch` throw;
+ * without this the client gets Cloudflare's HTML error page and its JSON parse
+ * fails confusingly (A-11). The cause is logged, never returned.
+ */
+function unavailable(route: "queue" | "room", err: unknown): Response {
+  logEvent("error", "durable_object_unavailable", {
+    route,
+    message: err instanceof Error ? err.message : String(err),
+  })
+  return jsonResponse({ error: "temporarily unavailable" }, 503, { "Retry-After": "5" })
 }
 
 function buildWsUrl(requestUrl: string, roomId: string): string {

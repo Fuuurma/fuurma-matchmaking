@@ -114,9 +114,8 @@ function requestInDo(game: string, path: string, init?: RequestInit) {
 async function restoreBind(game: string): Promise<void> {
   await runInDurableObject(queueStub(game), (instance) => {
     // Own properties shadow the prototype methods the tests replace.
-    const overridden = instance as unknown as { bindRoomSlots?: BindFn; postToRoom?: unknown }
-    delete overridden.bindRoomSlots
-    delete overridden.postToRoom
+    const overridden = instance as unknown as Record<string, unknown>
+    for (const name of ["bindRoomSlots", "postToRoom", "loadState"]) delete overridden[name]
   })
 }
 
@@ -1103,5 +1102,64 @@ describe("leaving a matched ticket releases the room (A-13)", () => {
     const res = await leave("tictactoe", host.ticket as string)
     expect(res.status).toBe(200)
     expect(((await res.json()) as { status: string }).status).toBe("left")
+  })
+})
+
+describe("error boundary (A-11)", () => {
+  // An env whose Durable Object stubs throw on fetch, as when a DO is overloaded
+  // or resets mid-request.
+  const brokenNamespace = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: () => {
+        throw new Error("Durable Object reset because its code was updated")
+      },
+    }),
+  }
+  const brokenEnv = {
+    ...env,
+    MATCHMAKING_QUEUES: brokenNamespace,
+    GAME_ROOM: brokenNamespace,
+  } as unknown as typeof env
+
+  it("answers a JSON 503 with Retry-After when the queue DO throws, and logs the cause", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {})
+    const res = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/health"),
+      brokenEnv,
+    )
+    expect(res.status).toBe(503)
+    expect(res.headers.get("Retry-After")).toBeTruthy()
+    expect(res.headers.get("Content-Type")).toContain("application/json")
+    expect(await res.json()).toEqual({ error: "temporarily unavailable" })
+    expect(logged.mock.calls.flat().join(" ")).toContain("Durable Object reset")
+  })
+
+  it("answers a JSON 503 when the room DO throws on an upgrade", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const res = await worker.fetch(
+      new Request("https://test.invalid/room/ABCD1234?game=tictactoe", {
+        headers: { Upgrade: "websocket" },
+      }),
+      brokenEnv,
+    )
+    expect(res.status).toBe(503)
+    expect(res.headers.get("Retry-After")).toBeTruthy()
+    expect(await res.json()).toEqual({ error: "temporarily unavailable" })
+  })
+
+  it("never echoes an internal error message from inside the queue DO", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    await runInDurableObject(queueStub("tictactoe"), (instance) => {
+      ;(instance as unknown as { loadState: () => never }).loadState = () => {
+        throw new Error("SQLITE_FULL: secret storage detail")
+      }
+    })
+    const res = await health("tictactoe")
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(text).not.toContain("SQLITE")
+    expect(text).not.toContain("secret")
+    expect(JSON.parse(text)).toEqual({ error: "server error" })
   })
 })
