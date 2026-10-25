@@ -1,15 +1,30 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { env, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it } from "vitest"
 import worker from "./index"
 
-async function join(game: string, peerId: string, guestId: string, displayName: string) {
+// Every join gets its own client address unless a test pins one: the DO keeps
+// ONE per-IP join counter for the whole file, and the suite joins often enough
+// from a shared "unknown" address to trip the 20-per-minute limit.
+let ipCounter = 0
+function nextIp(): string {
+  ipCounter += 1
+  return `198.18.${Math.floor(ipCounter / 256)}.${ipCounter % 256}`
+}
+
+async function join(
+  game: string,
+  peerId: string,
+  guestId: string,
+  displayName: string,
+  ip = nextIp(),
+) {
   const response = await worker.fetch(
     new Request(`https://test.invalid/api/matchmaking/${game}/join`, {
       method: "POST",
       body: JSON.stringify({ peerId, guestId, displayName }),
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
     }),
     env,
   )
@@ -549,5 +564,262 @@ describe("MatchmakingQueues via worker fetch", () => {
     const body = (await response.json()) as { status: string; ticket: string }
     expect(body.status).toBe("waiting")
     expect(body.ticket).not.toBe(staleTicket)
+  })
+})
+
+// The matchmaking -> room handoff (pre-claim fix). A match is only disclosed
+// once the room DO has acknowledged the allocation, and the DO-to-DO `fetch`
+// that does it opens the queue DO's input gate, so other requests interleave
+// with it. These tests park that call (or fail it) on the DO instance to force
+// the interleavings deterministically.
+type Slots = { host: string; guest: string }
+type BindFn = (roomId: string, match: unknown, slots: Slots) => Promise<boolean>
+type Answer = {
+  status: string
+  ticket?: string
+  roomId?: string
+  slotToken?: string
+  match?: { role: string; roomId: string; wsUrl: string } & Record<string, unknown>
+}
+
+const queueStub = (game: string) =>
+  env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+
+async function overrideBind(game: string, fn: BindFn): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = fn
+  })
+}
+
+/** A bind that stays "in flight" until the test releases it. */
+function parkedBind() {
+  let release!: (ok: boolean) => void
+  let enter!: () => void
+  const gate = new Promise<boolean>((resolve) => {
+    release = resolve
+  })
+  const reached = new Promise<void>((resolve) => {
+    enter = resolve
+  })
+  const fn: BindFn = async () => {
+    enter()
+    return gate
+  }
+  return { fn, reached, release }
+}
+
+/**
+ * Sends a request straight to the queue DO from inside it and reads the reply
+ * there. A request parked on a bind answers from the DO's own context, and a
+ * response body created there cannot be read from the test's context (workerd
+ * refuses cross-DO I/O). The Worker's wsUrl rewrite is skipped, which these
+ * tests do not look at.
+ */
+function requestInDo(game: string, path: string, init?: RequestInit) {
+  return runInDurableObject(queueStub(game), async (instance) => {
+    const res = await instance.fetch(
+      new Request(`https://test.invalid/api/matchmaking/${game}/${path}`, init),
+    )
+    return { status: res.status, body: (await res.json()) as Answer }
+  })
+}
+
+/** Puts the real room handoff back. */
+async function restoreBind(game: string): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    delete (instance as unknown as { bindRoomSlots?: BindFn }).bindRoomSlots
+  })
+}
+
+/** Empties a game's queue DO and drops any bind override a previous test left. */
+async function resetQueue(game: string): Promise<void> {
+  await restoreBind(game)
+  await runInDurableObject(queueStub(game), (_i, state) => state.storage.deleteAll())
+}
+
+async function answer(response: Response): Promise<Answer> {
+  return (await response.json()) as Answer
+}
+
+async function allocation(roomId: string) {
+  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
+  const stored = (await runInDurableObject(stub, (_i, state) => state.storage.get("room-state"))) as
+    | { expected?: Record<string, { token: string; role: string }> }
+    | undefined
+  return stored?.expected
+}
+
+describe("matchmaking to room binding", () => {
+  beforeEach(async () => {
+    await resetQueue("tictactoe")
+  })
+
+  it("hands each player only their own slotToken and binds both to the room", async () => {
+    const hostWait = await answer(await join("tictactoe", "bp-host", "bg-host", "Host"))
+    const guestRes = await join("tictactoe", "bp-guest", "bg-guest", "Guest")
+    const guestText = await guestRes.clone().text()
+    const guest = await answer(guestRes)
+    expect(guest.status).toBe("matched")
+    expect(guest.slotToken).toMatch(/^[0-9a-f]{32}$/)
+
+    const hostRes = await poll("tictactoe", hostWait.ticket as string)
+    const hostText = await hostRes.clone().text()
+    const host = await answer(hostRes)
+    expect(host.status).toBe("matched")
+    expect(host.match?.role).toBe("host")
+    expect(host.slotToken).toMatch(/^[0-9a-f]{32}$/)
+    expect(host.slotToken).not.toBe(guest.slotToken)
+
+    // Neither response may carry the other player's capability, or the
+    // internal bookkeeping that holds both.
+    expect(guestText).not.toContain(host.slotToken as string)
+    expect(hostText).not.toContain(guest.slotToken as string)
+    for (const text of [guestText, hostText]) {
+      expect(text).not.toContain('"slots"')
+      expect(text).not.toContain("slotsBound")
+    }
+
+    // The room was told which token belongs to which guestId.
+    const expected = await allocation(hostWait.roomId as string)
+    expect(expected?.["bg-host"]).toMatchObject({ token: host.slotToken, role: "host" })
+    expect(expected?.["bg-guest"]).toMatchObject({ token: guest.slotToken, role: "guest" })
+  })
+
+  it("fails closed while the room is unbound: nobody is told they matched", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "fc-host", "fg-host", "Host"))
+    const guestRes = await join("tictactoe", "fc-guest", "fg-guest", "Guest")
+    const guestText = await guestRes.clone().text()
+    const guest = await answer(guestRes)
+    expect(guest.status).toBe("waiting")
+    expect(guest.ticket).toMatch(/^[0-9a-f]{32}$/)
+    expect(guestText).not.toContain("slotToken")
+    expect(guestText).not.toContain('"match"')
+
+    // The host's side of the same match is withheld too.
+    const hostPoll = await answer(await poll("tictactoe", hostWait.ticket as string))
+    expect(hostPoll.status).toBe("waiting")
+  })
+
+  it("retries the bind on poll and discloses the match once the room acknowledges it", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "rt-host", "rg-host", "Host"))
+    const guestWait = await answer(await join("tictactoe", "rt-guest", "rg-guest", "Guest"))
+    expect(guestWait.status).toBe("waiting")
+    expect(await allocation(hostWait.roomId as string)).toBeUndefined()
+
+    // The room is reachable again: the next poll pushes the allocation.
+    await restoreBind("tictactoe")
+    const guest = await answer(await poll("tictactoe", guestWait.ticket as string))
+    expect(guest.status).toBe("matched")
+    expect(guest.match?.role).toBe("guest")
+    expect(guest.match?.roomId).toBe(hostWait.roomId)
+    expect(guest.slotToken).toMatch(/^[0-9a-f]{32}$/)
+    const expected = await allocation(hostWait.roomId as string)
+    expect(expected?.["rg-guest"]?.token).toBe(guest.slotToken)
+
+    const host = await answer(await poll("tictactoe", hostWait.ticket as string))
+    expect(host.status).toBe("matched")
+    expect(host.match?.role).toBe("host")
+    expect(host.slotToken).toBe(expected?.["rg-host"]?.token)
+  })
+
+  it("answers records stored before slot tokens existed as open-mode matches", async () => {
+    const ticket = "d".repeat(32)
+    await runInDurableObject(queueStub("tictactoe"), async (instance, state) => {
+      ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = async () => {
+        throw new Error("a legacy record has nothing to bind")
+      }
+      const player = (guestId: string) => ({ peerId: `${guestId}-peer`, displayName: "L", guestId })
+      await state.storage.put("queue-state", {
+        queues: {},
+        matches: {
+          [ticket]: {
+            roomId: "L".repeat(32),
+            host: player("legacy-host"),
+            guest: player("legacy-guest"),
+            role: "host",
+            game: "tictactoe",
+            createdAt: Date.now(),
+          },
+        },
+      })
+    })
+
+    const res = await poll("tictactoe", ticket)
+    const text = await res.clone().text()
+    const body = await answer(res)
+    expect(res.status).toBe(200)
+    expect(body.status).toBe("matched")
+    expect(body.match?.role).toBe("host")
+    expect(body.match?.wsUrl).toBe(`wss://test.invalid/room/${"L".repeat(32)}`)
+    expect(text).not.toContain("slotToken")
+  })
+
+  // The next three pin the lost-update race across the bind `await` and are
+  // red on the pre-fix handlers (`it.fails`); R1.1 deletes the `.fails`.
+  it.fails("does not lose a third player who queues while a match is binding (A-01)", async () => {
+    const hostWait = await answer(await join("tictactoe", "a1-host", "a1g-host", "Host"))
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const guestPending = requestInDo("tictactoe", "join", {
+      method: "POST",
+      body: JSON.stringify({ peerId: "a1-guest", guestId: "a1g-guest", displayName: "Guest" }),
+      headers: { "CF-Connecting-IP": nextIp() },
+    })
+    await bind.reached
+
+    const third = await answer(await join("tictactoe", "a1-third", "a1g-third", "Third"))
+    expect(third.status).toBe("waiting")
+
+    bind.release(true)
+    expect((await guestPending).body.status).toBe("matched")
+
+    const thirdPoll = await poll("tictactoe", third.ticket as string)
+    expect(thirdPoll.status).toBe(200)
+    expect((await answer(thirdPoll)).status).toBe("waiting")
+    expect(((await (await health("tictactoe")).json()) as { waiting: number }).waiting).toBe(1)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+  })
+
+  it.fails("keeps a leave that lands while the match is binding (F39)", async () => {
+    const hostWait = await answer(await join("tictactoe", "f39-host", "f39g-host", "Host"))
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const guestPending = requestInDo("tictactoe", "join", {
+      method: "POST",
+      body: JSON.stringify({ peerId: "f39-guest", guestId: "f39g-guest", displayName: "Guest" }),
+      headers: { "CF-Connecting-IP": nextIp() },
+    })
+    await bind.reached
+
+    expect((await leave("tictactoe", hostWait.ticket as string)).status).toBe(200)
+    bind.release(true)
+
+    // The host cancelled: the joiner must not be told it matched a ghost.
+    const guest = (await guestPending).body
+    expect(guest.status).toBe("waiting")
+    expect(guest.match).toBeUndefined()
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(404)
+    expect((await poll("tictactoe", guest.ticket as string)).status).toBe(200)
+    expect(((await (await health("tictactoe")).json()) as { matches: number }).matches).toBe(0)
+  })
+
+  it.fails("does not answer a poll with a match that was cancelled mid-bind (A-01)", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "pm-host", "pmg-host", "Host"))
+    const guestWait = await answer(await join("tictactoe", "pm-guest", "pmg-guest", "Guest"))
+    expect(guestWait.status).toBe("waiting")
+
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const pollPending = requestInDo("tictactoe", `poll?ticket=${guestWait.ticket}`)
+    await bind.reached
+    await leave("tictactoe", hostWait.ticket as string)
+    bind.release(true)
+
+    expect((await pollPending).status).toBe(404)
   })
 })

@@ -339,20 +339,15 @@ describe("GameRoomDO", () => {
     re.close()
   })
 
-  it.fails("a hello cannot claim a disclosed guestId that never connected", async () => {
-    // The join response discloses BOTH guestIds. MM-01 stopped a peer from
-    // RECLAIMING an existing slot, but a hello for a guestId that has no slot
-    // yet creates one with a fresh credential — so a peer that connects first
-    // and claims the opponent's disclosed id takes the slot and locks the
-    // real player out.
-    //
-    // `it.fails` because the secure behaviour is NOT implemented yet: this
-    // body is written to assert it, and currently fails. Whoever closes the
-    // hole must delete the `.fails` — leaving it would make a correct fix
-    // look like a regression. Closing it needs the room to know which
-    // guestIds matchmaking allocated (a per-player capability handed over at
-    // match time), which is a wire-protocol change across the Worker and both
-    // game clients, so it is an owner decision, not a patch.
+  // KNOWN LIMITATION, by design: an OPEN room (an invite link, or any room that
+  // never received matchmaking's /expect allocation) has open guestId-claim
+  // semantics, so a first hello for ANY unseen guestId gets a seat. Invite codes
+  // are the only credential there. The body below asserts the stricter behaviour
+  // and therefore fails; `it.fails` keeps it as a tripwire — if this ever starts
+  // passing, open rooms became closed and the invite flow must be re-checked.
+  // Matchmade rooms ARE closed: see "refuses a disclosed guestId without its
+  // slotToken in an allocated room" below, and the F20/F22 allocation tests.
+  it.fails("open invite rooms: a hello can still claim a disclosed guestId that never connected", async () => {
     const rid = roomId("preclaim")
     const host = await openSocket(rid)
     send(host, { type: "hello", guestId: "h", displayName: "H" })
@@ -375,6 +370,36 @@ describe("GameRoomDO", () => {
       slots.map((s) => s.guestId),
       "only the connecting player holds a slot",
     ).toEqual(["h"])
+  })
+
+  it("refuses a disclosed guestId without its slotToken in an allocated room", async () => {
+    // Same attack as the open-room tripwire above, but the room was allocated by
+    // matchmaking: the opponent's guestId alone is no longer a capability.
+    const rid = roomId("claimed")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await stub.fetch(
+      new Request("https://test.invalid/expect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          slots: [
+            { guestId: "h", token: "tokH", role: "host" },
+            { guestId: "victim", token: "tokV", role: "guest" },
+          ],
+        }),
+      }),
+    )
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host)
+
+    const attacker = await openSocket(rid)
+    send(attacker, { type: "hello", guestId: "victim", displayName: "NotVictim" })
+    const refused = JSON.parse(await nextMessage(attacker, 1000, "claim without slotToken"))
+    expect(refused.type).toBe("error")
+    expect(refused.reconnectToken).toBeUndefined()
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h"])
+    host.close()
   })
 
   it("refuses to mint a credential for a pre-MM-01 slot's first claimant", async () => {
