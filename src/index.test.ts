@@ -602,6 +602,40 @@ describe("MatchmakingQueues via worker fetch", () => {
     await resetQueue("gambit-deck")
   })
 
+  it("refuses a fourth live entry from one address but leaves other addresses alone (A-03)", async () => {
+    // Entries from one address cannot pile up organically (a second joiner pairs
+    // with the first), so the three live entries are seeded.
+    const now = Date.now()
+    const seeded = ["a", "b", "c"].map((id, i) => ({
+      ticket: String(i + 1).repeat(32),
+      peerId: `ip-peer-${id}`,
+      roomId: id.toUpperCase().repeat(32),
+      displayName: "Ip",
+      guestId: `ip-guest-${id}`,
+      joinedAt: now,
+      createdAt: now,
+      ip: "203.0.113.7",
+    }))
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", { queues: { tictactoe: seeded }, matches: {} }),
+    )
+
+    const refused = await join("tictactoe", "ip-peer-new", "ip-guest-new", "New", "203.0.113.7")
+    expect(refused.status).toBe(429)
+    expect(refused.headers.get("Retry-After")).toBeTruthy()
+    expect(((await refused.json()) as { error: string }).error).toMatch(/active searches/i)
+
+    const stranger = await join(
+      "tictactoe",
+      "ip-peer-other",
+      "ip-guest-other",
+      "Other",
+      "203.0.113.8",
+    )
+    expect(stranger.status).toBe(200)
+    expect((await answer(stranger)).status).toBe("matched")
+  })
+
   it("expires a queued ticket at its absolute age cap even while it keeps polling", async () => {
     const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("tictactoe"))
     const staleTicket = "a".repeat(32)

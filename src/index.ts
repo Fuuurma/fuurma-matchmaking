@@ -67,6 +67,8 @@ interface Player {
    * persisted before this field existed fall back to `joinedAt`.
    */
   createdAt?: number
+  /** Client address at join time; bounds how many live entries one address holds. */
+  ip?: string
 }
 
 interface QueueState {
@@ -79,6 +81,7 @@ const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
 const MAX_TICKET_AGE_MS = 600_000
 const MAX_QUEUE_LENGTH = 100
+const MAX_ENTRIES_PER_IP = 3
 const MATCH_TIMEOUT_MS = 300_000
 const JOIN_RATE_WINDOW_MS = 60_000
 const MAX_JOIN_ATTEMPTS_PER_WINDOW = 20
@@ -253,6 +256,7 @@ export class MatchmakingQueues extends DurableObject {
       guestId: req.guestId ?? crypto.randomUUID(),
       joinedAt: now,
       createdAt: now,
+      ip: clientIp(request),
     }
 
     // Prune expired matches and queue entries, and drop any live entry of the
@@ -271,6 +275,14 @@ export class MatchmakingQueues extends DurableObject {
 
     if (queue.length >= MAX_QUEUE_LENGTH) {
       return jsonResponse({ error: "queue full — retry shortly" }, 503, {
+        "Retry-After": "30",
+      })
+    }
+    // Entries only pile up unpaired, so 3 per address still lets a shared NAT
+    // play (its players pair with each other) while one address cannot hold the
+    // queue. Checked before pairing, like the cap above (A-03).
+    if (queue.filter((p) => p.ip === player.ip).length >= MAX_ENTRIES_PER_IP) {
+      return jsonResponse({ error: "too many active searches from this address" }, 429, {
         "Retry-After": "30",
       })
     }
@@ -344,10 +356,7 @@ export class MatchmakingQueues extends DurableObject {
     request: Request,
     now: number,
   ): Promise<Response | null> {
-    const ip =
-      request.headers.get("CF-Connecting-IP") ??
-      request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
-      "unknown"
+    const ip = clientIp(request)
     const rateLimits = state.rateLimits ?? {}
     for (const [key, entry] of Object.entries(rateLimits)) {
       if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) delete rateLimits[key]
@@ -579,6 +588,14 @@ export default {
 
     return response
   },
+}
+
+function clientIp(request: Request): string {
+  return (
+    request.headers.get("CF-Connecting-IP") ??
+    request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
+    "unknown"
+  )
 }
 
 function buildWsUrl(requestUrl: string, roomId: string): string {
