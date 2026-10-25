@@ -963,3 +963,78 @@ describe("match records and health", () => {
     expect(last?.status).toBe(429)
   })
 })
+
+describe("pairing freshness", () => {
+  it("skips a queued player who stopped polling and pairs with one who is polling (A-05)", async () => {
+    const start = Date.now()
+    const nowSpy = vi.spyOn(Date, "now")
+    nowSpy.mockReturnValue(start)
+    const ghost = await answer(await join("tictactoe", "fr-ghost", "frg-ghost", "Ghost"))
+
+    // The ghost closed its tab; 12 s later it is still inside the 30 s TTL but
+    // has not polled for longer than a live client ever goes silent.
+    nowSpy.mockReturnValue(start + 12_000)
+    const second = await answer(await join("tictactoe", "fr-second", "frg-second", "Second"))
+    expect(second.status).toBe("waiting")
+
+    // A third player pairs with the one who just joined, not with the ghost.
+    nowSpy.mockReturnValue(start + 13_000)
+    const third = await answer(await join("tictactoe", "fr-third", "frg-third", "Third"))
+    expect(third.status).toBe("matched")
+    expect(third.match?.role).toBe("guest")
+    expect((third.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "frg-second",
+    )
+
+    // The ghost was only skipped, not removed: if it polls again it is seen.
+    nowSpy.mockReturnValue(start + 14_000)
+    expect((await answer(await poll("tictactoe", ghost.ticket as string))).status).toBe("waiting")
+    nowSpy.mockReturnValue(start + 15_000)
+    const fourth = await answer(await join("tictactoe", "fr-fourth", "frg-fourth", "Fourth"))
+    expect(fourth.status).toBe("matched")
+    expect((fourth.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "frg-ghost",
+    )
+  })
+
+  it("keeps pairing with a player whose polls keep arriving", async () => {
+    const start = Date.now()
+    const nowSpy = vi.spyOn(Date, "now")
+    nowSpy.mockReturnValue(start)
+    const waiting = await answer(await join("tictactoe", "fp-wait", "fpg-wait", "Wait"))
+    for (const at of [4_000, 8_000, 12_000]) {
+      nowSpy.mockReturnValue(start + at)
+      expect((await answer(await poll("tictactoe", waiting.ticket as string))).status).toBe(
+        "waiting",
+      )
+    }
+    nowSpy.mockReturnValue(start + 13_000)
+    const joiner = await answer(await join("tictactoe", "fp-join", "fpg-join", "Join"))
+    expect(joiner.status).toBe("matched")
+  })
+
+  it("judges an entry with no recorded poll (after a DO restart) by its joinedAt", async () => {
+    const now = Date.now()
+    const entry = (id: string, joinedAt: number) => ({
+      ticket: id.repeat(32),
+      peerId: `rs-peer-${id}`,
+      roomId: id.toUpperCase().repeat(32),
+      displayName: "Rs",
+      guestId: `rs-guest-${id}`,
+      joinedAt,
+      createdAt: joinedAt,
+    })
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: { tictactoe: [entry("a", now - 12_000), entry("b", now - 2_000)] },
+        matches: {},
+      }),
+    )
+
+    const joiner = await answer(await join("tictactoe", "rs-join", "rs-guest-join", "Join"))
+    expect(joiner.status).toBe("matched")
+    expect((joiner.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "rs-guest-b",
+    )
+  })
+})

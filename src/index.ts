@@ -89,6 +89,12 @@ const QUEUE_TIMEOUT_MS = 30_000
 const MAX_TICKET_AGE_MS = 600_000
 const MAX_QUEUE_LENGTH = 100
 const MAX_ENTRIES_PER_IP = 3
+/**
+ * A queued player pairs only if it was seen this recently. Gambit polls every
+ * 500 ms and tic-tac-toe at most every 4 s, so 10 s is two slow intervals; the
+ * 30 s TTL alone left a closed tab matchable for up to 30 s (A-05).
+ */
+const PAIRING_FRESHNESS_MS = 10_000
 const MATCH_TIMEOUT_MS = 90_000
 const COLLECTED_MATCH_TTL_MS = 15_000
 const MAX_MATCH_RECORDS = 400
@@ -140,6 +146,18 @@ export class MatchmakingQueues extends DurableObject {
    * binding if the counters must survive restarts.
    */
   private joinCounters = new Map<string, { count: number; windowStartedAt: number }>()
+
+  /**
+   * When each queued ticket was last seen (join or poll). In memory only: the
+   * persisted `joinedAt` is refreshed at most every 15 s, far too coarse, and a
+   * write per poll would be a lot of traffic. After a DO restart a ticket falls
+   * back to `joinedAt`, so it can be skipped until its next poll (<= 4 s).
+   */
+  private lastSeen = new Map<string, number>()
+
+  private isFresh(p: Player, now: number): boolean {
+    return now - (this.lastSeen.get(p.ticket) ?? p.joinedAt) < PAIRING_FRESHNESS_MS
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
@@ -319,8 +337,13 @@ export class MatchmakingQueues extends DurableObject {
       })
     }
 
-    const opponent = queue[0]
+    // Only ticket-holders still in the queue need a lastSeen entry.
+    for (const t of this.lastSeen.keys()) {
+      if (!queue.some((p) => p.ticket === t)) this.lastSeen.delete(t)
+    }
+    const opponent = queue.find((p) => this.isFresh(p, now))
     if (opponent) {
+      this.lastSeen.delete(opponent.ticket)
       state.queues[game] = queue.filter((p) => p.ticket !== opponent.ticket)
       const match: Match = {
         roomId: opponent.roomId,
@@ -367,6 +390,7 @@ export class MatchmakingQueues extends DurableObject {
         // for the next join; upgrade if pairing ever moves off join time.
         const live = (current.queues[game] ?? []).filter((p) => isLiveTicket(p, Date.now()))
         current.queues[game] = [...live, player]
+        this.lastSeen.set(ticket, Date.now())
         await this.saveState(current)
         return jsonResponse({ status: "waiting", ticket, roomId })
       }
@@ -383,6 +407,7 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     state.queues[game] = [...queue, player]
+    this.lastSeen.set(ticket, now)
     await this.saveState(state)
     return jsonResponse({ status: "waiting", ticket, roomId })
   }
@@ -494,6 +519,7 @@ export class MatchmakingQueues extends DurableObject {
       return jsonResponse({ error: "ticket not found" }, 404)
     }
 
+    this.lastSeen.set(ticket, now)
     // Refresh joinedAt on each poll so actively-polling players don't
     // time out. The 30s queue timeout is for cleaning up abandoned
     // entries, not for limiting how long someone can wait for a match.
@@ -508,6 +534,7 @@ export class MatchmakingQueues extends DurableObject {
 
   private async handleLeave(game: string, ticket: string): Promise<Response> {
     const now = Date.now()
+    this.lastSeen.delete(ticket)
     const state = await this.loadState()
 
     const queue = state.queues[game] ?? []
