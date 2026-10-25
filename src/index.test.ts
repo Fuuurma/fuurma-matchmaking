@@ -53,6 +53,94 @@ async function health(game: string) {
   return worker.fetch(new Request(`https://test.invalid/api/matchmaking/${game}/health`), env)
 }
 
+// The matchmaking -> room handoff (pre-claim fix). A match is only disclosed
+// once the room DO has acknowledged the allocation, and the DO-to-DO `fetch`
+// that does it opens the queue DO's input gate, so other requests interleave
+// with it. These tests park that call (or fail it) on the DO instance to force
+// the interleavings deterministically.
+type Slots = { host: string; guest: string }
+type BindFn = (roomId: string, match: unknown, slots: Slots) => Promise<boolean>
+type Answer = {
+  status: string
+  ticket?: string
+  roomId?: string
+  slotToken?: string
+  match?: { role: string; roomId: string; wsUrl: string } & Record<string, unknown>
+}
+
+const queueStub = (game: string) =>
+  env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+
+async function overrideBind(game: string, fn: BindFn): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = fn
+  })
+}
+
+/** A bind that stays "in flight" until the test releases it. */
+function parkedBind() {
+  let release!: (ok: boolean) => void
+  let enter!: () => void
+  const gate = new Promise<boolean>((resolve) => {
+    release = resolve
+  })
+  const reached = new Promise<void>((resolve) => {
+    enter = resolve
+  })
+  const fn: BindFn = async () => {
+    enter()
+    return gate
+  }
+  return { fn, reached, release }
+}
+
+/**
+ * Sends a request straight to the queue DO from inside it and reads the reply
+ * there. A request parked on a bind answers from the DO's own context, and a
+ * response body created there cannot be read from the test's context (workerd
+ * refuses cross-DO I/O). The Worker's wsUrl rewrite is skipped, which these
+ * tests do not look at.
+ */
+function requestInDo(game: string, path: string, init?: RequestInit) {
+  return runInDurableObject(queueStub(game), async (instance) => {
+    const res = await instance.fetch(
+      new Request(`https://test.invalid/api/matchmaking/${game}/${path}`, init),
+    )
+    return { status: res.status, body: (await res.json()) as Answer }
+  })
+}
+
+/** Puts the real room handoff back. */
+async function restoreBind(game: string): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    delete (instance as unknown as { bindRoomSlots?: BindFn }).bindRoomSlots
+  })
+}
+
+/** Empties a game's queue DO and drops any bind override a previous test left. */
+async function resetQueue(game: string): Promise<void> {
+  await restoreBind(game)
+  await runInDurableObject(queueStub(game), (_i, state) => state.storage.deleteAll())
+}
+
+async function answer(response: Response): Promise<Answer> {
+  return (await response.json()) as Answer
+}
+
+async function allocation(roomId: string) {
+  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
+  const stored = (await runInDurableObject(stub, (_i, state) => state.storage.get("room-state"))) as
+    | { expected?: Record<string, { token: string; role: string }> }
+    | undefined
+  return stored?.expected
+}
+
+// Each test starts from empty queues; the DOs persist across tests in a file.
+beforeEach(async () => {
+  await resetQueue("tictactoe")
+  await resetQueue("gambit-deck")
+})
+
 describe("MatchmakingQueues via worker fetch", () => {
   it("rejects malformed and oversized join payloads", async () => {
     const malformed = await worker.fetch(
@@ -210,32 +298,29 @@ describe("MatchmakingQueues via worker fetch", () => {
     await leave("tictactoe", hostBody.ticket)
   })
 
-  it("does not pair the same guestId", async () => {
+  it("never pairs a guestId with itself: a repeat join supersedes the old entry", async () => {
     const first = await join("tictactoe", "peer-5", "g5", "Alice")
     const firstBody = (await first.json()) as { status: "waiting"; ticket: string }
     expect(firstBody.status).toBe("waiting")
 
-    // Same guestId, different peerId — should not pair with the first.
+    // Same guestId, different peerId: still one player, so one queue entry.
     const duplicate = await join("tictactoe", "peer-5b", "g5", "Alice2")
     const duplicateBody = (await duplicate.json()) as { status: "waiting"; ticket: string }
     expect(duplicateBody.status).toBe("waiting")
+    expect(duplicateBody.ticket).not.toBe(firstBody.ticket)
+    expect((await poll("tictactoe", firstBody.ticket)).status).toBe(404)
 
-    // A different guest pairs with the first queued player.
+    // A different guest pairs with the surviving entry.
     const other = await join("tictactoe", "peer-6", "g6", "Bob")
     const otherBody = (await other.json()) as {
       status: "matched"
-      match: { host: { guestId: string }; guest: { guestId: string } }
+      match: { host: { guestId: string; peerId: string }; guest: { guestId: string } }
     }
     expect(otherBody.status).toBe("matched")
     expect(otherBody.match.host.guestId).toBe("g5")
+    expect(otherBody.match.host.peerId).toBe("peer-5b")
     expect(otherBody.match.guest.guestId).toBe("g6")
 
-    // The duplicate ticket is still waiting.
-    const pollDuplicate = await poll("tictactoe", duplicateBody.ticket)
-    const pollDuplicateBody = (await pollDuplicate.json()) as { status: string }
-    expect(pollDuplicateBody.status).toBe("waiting")
-
-    await leave("tictactoe", firstBody.ticket)
     await leave("tictactoe", duplicateBody.ticket)
   })
 
@@ -303,24 +388,55 @@ describe("MatchmakingQueues via worker fetch", () => {
     expect(body.error).toBe("unknown game")
   })
 
-  it("returns existing ticket when same peerId re-joins", async () => {
+  it("supersedes the old entry when the same player re-joins (refresh lost the ticket)", async () => {
     const first = await join("tictactoe", "peer-dup", "gd1", "Dup")
     const firstBody = (await first.json()) as { status: string; ticket: string; roomId: string }
     expect(firstBody.status).toBe("waiting")
 
-    const second = await join("tictactoe", "peer-dup", "gd1-different", "Dup2")
+    const second = await join("tictactoe", "peer-dup", "gd1", "Dup")
     const secondBody = (await second.json()) as { status: string; ticket: string; roomId: string }
     expect(secondBody.status).toBe("waiting")
-    // Same ticket returned — no duplicate queue entry.
-    expect(secondBody.ticket).toBe(firstBody.ticket)
-    expect(secondBody.roomId).toBe(firstBody.roomId)
+    expect(secondBody.ticket).toMatch(/^[0-9a-f]{32}$/)
+    expect(secondBody.ticket).not.toBe(firstBody.ticket)
+    expect(secondBody.roomId).not.toBe(firstBody.roomId)
 
-    // Health should show only 1 waiting player.
-    const h = await health("tictactoe")
-    const hBody = (await h.json()) as { waiting: number }
-    expect(hBody.waiting).toBe(1)
+    expect((await poll("tictactoe", firstBody.ticket)).status).toBe(404)
+    const live = (await (await poll("tictactoe", secondBody.ticket)).json()) as { status: string }
+    expect(live.status).toBe("waiting")
+    const h = (await (await health("tictactoe")).json()) as { waiting: number }
+    expect(h.waiting).toBe(1)
 
-    await leave("tictactoe", firstBody.ticket)
+    await leave("tictactoe", secondBody.ticket)
+  })
+
+  it("discloses nothing to a stranger who re-joins with a known peerId or guestId (A-02)", async () => {
+    // peerId and guestId reach every opponent in the match payload, so neither
+    // may act as a bearer credential for the victim's live ticket.
+    for (const known of ["peerId", "guestId"] as const) {
+      await resetQueue("tictactoe")
+      const victim = await join("tictactoe", "peer-victim", "g-victim", "Victim")
+      const victimBody = (await victim.json()) as { ticket: string; roomId: string }
+
+      const attacker =
+        known === "peerId"
+          ? await join("tictactoe", "peer-victim", "g-attacker", "Attacker")
+          : await join("tictactoe", "peer-attacker", "g-victim", "Attacker")
+      const text = await attacker.text()
+      expect(JSON.parse(text).status).toBe("waiting")
+      expect(text).not.toContain(victimBody.ticket)
+      expect(text).not.toContain(victimBody.roomId)
+      // The victim's old ticket is superseded, not handed to anybody.
+      expect((await poll("tictactoe", victimBody.ticket)).status).toBe(404)
+    }
+  })
+
+  it("keeps one queue entry per guestId however many peerIds it presents (A-03)", async () => {
+    for (let i = 0; i < 30; i += 1) {
+      const res = await join("tictactoe", `flood-peer-${i}`, "flood-guest", "Flood")
+      expect(res.status).toBe(200)
+    }
+    const h = (await (await health("tictactoe")).json()) as { waiting: number }
+    expect(h.waiting).toBe(1)
   })
 
   it("sanitizes display names (strips HTML chars and control chars)", async () => {
@@ -457,54 +573,33 @@ describe("MatchmakingQueues via worker fetch", () => {
   // operation serialized the whole state value, so a grown queue amplified
   // into matchmaking latency for everyone.
   it("refuses the join beyond the per-game queue cap with a retryable 503", async () => {
-    // All joins share one guestId so nothing pairs and the queue fills.
-    // Distinct IPs keep the per-IP join throttle out of the measurement.
-    for (let i = 0; i < 100; i += 1) {
-      const response = await worker.fetch(
-        new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
-          method: "POST",
-          body: JSON.stringify({
+    // One player can no longer fill the queue (one entry per guestId, A-03), so
+    // the 100-entry backstop is reached by seeding live entries directly.
+    const now = Date.now()
+    await runInDurableObject(queueStub("gambit-deck"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: {
+          "gambit-deck": Array.from({ length: 100 }, (_, i) => ({
+            ticket: i.toString(16).padStart(32, "0"),
             peerId: `cap-peer-${i}`,
-            guestId: "cap-guest",
+            roomId: `CAP${i}`.padEnd(32, "0"),
             displayName: "Cap",
-          }),
-          headers: {
-            "Content-Type": "application/json",
-            "CF-Connecting-IP": `192.0.${Math.floor(i / 256)}.${i % 256}`,
-          },
-        }),
-        env,
-      )
-      expect(response.status).toBe(200)
-    }
-
-    const overflow = await worker.fetch(
-      new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
-        method: "POST",
-        body: JSON.stringify({ peerId: "cap-peer-overflow", guestId: "cap-guest" }),
-        headers: {
-          "Content-Type": "application/json",
-          "CF-Connecting-IP": "203.0.113.9",
+            guestId: `cap-guest-${i}`,
+            joinedAt: now,
+            createdAt: now,
+          })),
         },
+        matches: {},
       }),
-      env,
     )
+
+    const overflow = await join("gambit-deck", "cap-peer-overflow", "cap-guest-overflow", "Cap")
     expect(overflow.status).toBe(503)
     expect(overflow.headers.get("Retry-After")).toBeTruthy()
     expect(((await overflow.json()) as { error: string }).error).toMatch(/queue full/i)
 
-    // The cap entries are real live tickets — drain them so later tests on
-    // this game see an empty queue.
-    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
-    await runInDurableObject(stub, async (_i, s) => {
-      const stored = (await s.storage.get("queue-state")) as {
-        queues: Record<string, Array<{ guestId: string }>>
-      }
-      stored.queues["gambit-deck"] = (stored.queues["gambit-deck"] ?? []).filter(
-        (p) => p.guestId !== "cap-guest",
-      )
-      await s.storage.put("queue-state", stored)
-    })
+    // Leave the game empty for the tests after this one.
+    await resetQueue("gambit-deck")
   })
 
   it("expires a queued ticket at its absolute age cap even while it keeps polling", async () => {
@@ -541,24 +636,24 @@ describe("MatchmakingQueues via worker fetch", () => {
     const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
     const staleTicket = "b".repeat(32)
     const now = Date.now()
-    await runInDurableObject(stub, async (_i, s) => {
-      const stored = (await s.storage.get("queue-state")) as {
-        queues: Record<string, unknown[]>
-        matches: Record<string, unknown>
-      }
-      const queue = stored.queues["gambit-deck"] ?? []
-      stored.queues["gambit-deck"] = queue
-      queue.push({
-        ticket: staleTicket,
-        peerId: "revive-peer",
-        roomId: "B".repeat(32),
-        displayName: "Revive",
-        guestId: "revive-guest",
-        joinedAt: now,
-        createdAt: now - 601_000,
-      })
-      await s.storage.put("queue-state", stored)
-    })
+    await runInDurableObject(stub, (_i, s) =>
+      s.storage.put("queue-state", {
+        queues: {
+          "gambit-deck": [
+            {
+              ticket: staleTicket,
+              peerId: "revive-peer",
+              roomId: "B".repeat(32),
+              displayName: "Revive",
+              guestId: "revive-guest",
+              joinedAt: now,
+              createdAt: now - 601_000,
+            },
+          ],
+        },
+        matches: {},
+      }),
+    )
 
     const response = await join("gambit-deck", "revive-peer", "revive-guest", "Revive")
     const body = (await response.json()) as { status: string; ticket: string }
@@ -567,93 +662,7 @@ describe("MatchmakingQueues via worker fetch", () => {
   })
 })
 
-// The matchmaking -> room handoff (pre-claim fix). A match is only disclosed
-// once the room DO has acknowledged the allocation, and the DO-to-DO `fetch`
-// that does it opens the queue DO's input gate, so other requests interleave
-// with it. These tests park that call (or fail it) on the DO instance to force
-// the interleavings deterministically.
-type Slots = { host: string; guest: string }
-type BindFn = (roomId: string, match: unknown, slots: Slots) => Promise<boolean>
-type Answer = {
-  status: string
-  ticket?: string
-  roomId?: string
-  slotToken?: string
-  match?: { role: string; roomId: string; wsUrl: string } & Record<string, unknown>
-}
-
-const queueStub = (game: string) =>
-  env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
-
-async function overrideBind(game: string, fn: BindFn): Promise<void> {
-  await runInDurableObject(queueStub(game), (instance) => {
-    ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = fn
-  })
-}
-
-/** A bind that stays "in flight" until the test releases it. */
-function parkedBind() {
-  let release!: (ok: boolean) => void
-  let enter!: () => void
-  const gate = new Promise<boolean>((resolve) => {
-    release = resolve
-  })
-  const reached = new Promise<void>((resolve) => {
-    enter = resolve
-  })
-  const fn: BindFn = async () => {
-    enter()
-    return gate
-  }
-  return { fn, reached, release }
-}
-
-/**
- * Sends a request straight to the queue DO from inside it and reads the reply
- * there. A request parked on a bind answers from the DO's own context, and a
- * response body created there cannot be read from the test's context (workerd
- * refuses cross-DO I/O). The Worker's wsUrl rewrite is skipped, which these
- * tests do not look at.
- */
-function requestInDo(game: string, path: string, init?: RequestInit) {
-  return runInDurableObject(queueStub(game), async (instance) => {
-    const res = await instance.fetch(
-      new Request(`https://test.invalid/api/matchmaking/${game}/${path}`, init),
-    )
-    return { status: res.status, body: (await res.json()) as Answer }
-  })
-}
-
-/** Puts the real room handoff back. */
-async function restoreBind(game: string): Promise<void> {
-  await runInDurableObject(queueStub(game), (instance) => {
-    delete (instance as unknown as { bindRoomSlots?: BindFn }).bindRoomSlots
-  })
-}
-
-/** Empties a game's queue DO and drops any bind override a previous test left. */
-async function resetQueue(game: string): Promise<void> {
-  await restoreBind(game)
-  await runInDurableObject(queueStub(game), (_i, state) => state.storage.deleteAll())
-}
-
-async function answer(response: Response): Promise<Answer> {
-  return (await response.json()) as Answer
-}
-
-async function allocation(roomId: string) {
-  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
-  const stored = (await runInDurableObject(stub, (_i, state) => state.storage.get("room-state"))) as
-    | { expected?: Record<string, { token: string; role: string }> }
-    | undefined
-  return stored?.expected
-}
-
 describe("matchmaking to room binding", () => {
-  beforeEach(async () => {
-    await resetQueue("tictactoe")
-  })
-
   it("hands each player only their own slotToken and binds both to the room", async () => {
     const hostWait = await answer(await join("tictactoe", "bp-host", "bg-host", "Host"))
     const guestRes = await join("tictactoe", "bp-guest", "bg-guest", "Guest")

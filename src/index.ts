@@ -242,10 +242,6 @@ export class MatchmakingQueues extends DurableObject {
     const rateLimit = await this.consumeJoinAttempt(state, request, now)
     if (rateLimit) return rateLimit
 
-    // Prune expired queue entries and matches in one pass.
-    const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
-    pruneExpiredMatches(state, now)
-
     const ticket = generateTicket()
     const roomId = generateRoomId()
 
@@ -259,33 +255,27 @@ export class MatchmakingQueues extends DurableObject {
       createdAt: now,
     }
 
-    // Guard: one active queue entry per peerId. If the same player re-joins
-    // (e.g. lost their ticket and retried), return their existing waiting
-    // ticket instead of creating a duplicate queue entry. Refresh joinedAt
-    // so the 30s queue timeout resets on each rejoin attempt.
+    // Prune expired matches and queue entries, and drop any live entry of the
+    // same player. A repeat join (known peerId OR guestId — a refresh that lost
+    // the ticket) SUPERSEDES the old entry with a fresh ticket and roomId. The
+    // stored ticket is never handed back: peerId and guestId reach every
+    // opponent in the match payload, so answering with the ticket let anyone who
+    // knew one take over or cancel that player's search (A-02). It also keeps
+    // the queue to one entry per guestId, so one client cannot fill it (A-03).
+    // Residual: whoever knows a peerId can cancel that player's search by
+    // re-joining, bounded by the join rate limit.
+    pruneExpiredMatches(state, now)
+    const queue = (state.queues[game] ?? []).filter(
+      (p) => isLiveTicket(p, now) && p.peerId !== player.peerId && p.guestId !== player.guestId,
+    )
+
     if (queue.length >= MAX_QUEUE_LENGTH) {
       return jsonResponse({ error: "queue full — retry shortly" }, 503, {
         "Retry-After": "30",
       })
     }
 
-    const existingEntry = queue.find((p) => p.peerId === player.peerId)
-    if (existingEntry) {
-      existingEntry.joinedAt = now
-      state.queues[game] = queue
-      await this.saveState(state)
-      logEvent("warn", "duplicate_join_returned_existing", {
-        game,
-        peerId: player.peerId.slice(0, 8),
-      })
-      return jsonResponse({
-        status: "waiting",
-        ticket: existingEntry.ticket,
-        roomId: existingEntry.roomId,
-      })
-    }
-
-    const opponent = queue.find((p) => p.guestId !== player.guestId && p.peerId !== player.peerId)
+    const opponent = queue[0]
     if (opponent) {
       state.queues[game] = queue.filter((p) => p.ticket !== opponent.ticket)
       const match: Match = {
