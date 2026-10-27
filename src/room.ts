@@ -147,6 +147,7 @@ interface Slot {
    * slots persisted before this field existed.
    */
   viaExpect?: boolean
+  lastReactionAt?: number
 }
 
 /** 128 bits of randomness, hex-encoded — the per-slot reconnect credential. */
@@ -319,6 +320,34 @@ export class GameRoomDO extends DurableObject {
         if (!attachment || isPendingConnection(attachment)) {
           this.sendError(ws, "invalid", "send hello first")
           return
+        }
+        if (type === "social_reaction") {
+          const reaction = parsed as Record<string, unknown>
+          const ids = [
+            "hello",
+            "good_luck",
+            "nice_move",
+            "wow",
+            "oops",
+            "thinking",
+            "thanks",
+            "good_game",
+            "well_played",
+            "rematch",
+          ]
+          if (
+            Object.keys(reaction).some((key) => key !== "type" && key !== "id") ||
+            typeof reaction.id !== "string" ||
+            !ids.includes(reaction.id)
+          )
+            return
+          const state = await this.loadState()
+          const slot = state.slots.find((entry) => entry.guestId === attachment.guestId)
+          if (!slot) return
+          const now = Date.now()
+          if (slot.lastReactionAt !== undefined && now - slot.lastReactionAt < 3000) return
+          slot.lastReactionAt = now
+          await this.saveState(state)
         }
         // Relay any other well-formed message verbatim to the other peer.
         // Each game owns its own protocol on top of the room envelope.
