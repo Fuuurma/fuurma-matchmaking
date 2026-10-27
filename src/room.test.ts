@@ -141,6 +141,12 @@ describe("GameRoomDO", () => {
     await nextMessage(guest)
     await nextMessage(host)
 
+    send(guest, { type: "social_reaction", id: "hello", protocol: "gambit-deck:v1" })
+    expect(JSON.parse(await nextMessage(host))).toEqual({
+      type: "social_reaction",
+      id: "hello",
+      protocol: "gambit-deck:v1",
+    })
     send(host, { type: "social_reaction", id: "hello" })
     expect(JSON.parse(await nextMessage(guest))).toEqual({ type: "social_reaction", id: "hello" })
     send(host, { type: "social_reaction", id: "hello" })

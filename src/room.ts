@@ -336,7 +336,10 @@ export class GameRoomDO extends DurableObject {
             "rematch",
           ]
           if (
-            Object.keys(reaction).some((key) => key !== "type" && key !== "id") ||
+            Object.keys(reaction).some(
+              (key) => key !== "type" && key !== "id" && key !== "protocol",
+            ) ||
+            (reaction.protocol !== undefined && reaction.protocol !== "gambit-deck:v1") ||
             typeof reaction.id !== "string" ||
             !ids.includes(reaction.id)
           )
