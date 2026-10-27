@@ -18,13 +18,31 @@ async function join(
   peerId: string,
   guestId: string,
   displayName: string,
-  ip = nextIp(),
+  retryTicketOrIp?: string,
 ) {
+  // Two positional conveniences share the 5th slot: main's IP-pinning tests
+  // pass the address, the proof-gate tests pass the retry ticket. The shape
+  // disambiguates — a dotted quad is the address, anything else the ticket.
+  const isIp =
+    typeof retryTicketOrIp === "string" &&
+    /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(retryTicketOrIp)
+  const ip = isIp
+    ? (retryTicketOrIp as string)
+    : ((retryTicketOrIp ? undefined : nextIp()) ?? nextIp())
+  const ticket = isIp ? undefined : retryTicketOrIp
   const response = await worker.fetch(
     new Request(`https://test.invalid/api/matchmaking/${game}/join`, {
       method: "POST",
-      body: JSON.stringify({ peerId, guestId, displayName }),
-      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+      body: JSON.stringify({
+        peerId,
+        guestId,
+        displayName,
+        ...(ticket ? { retryTicket: ticket } : {}),
+      }),
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": ip ?? nextIp(),
+      },
     }),
     env,
   )
@@ -394,30 +412,45 @@ describe("MatchmakingQueues via worker fetch", () => {
     expect(body.error).toBe("unknown game")
   })
 
-  it("supersedes the old entry when the same player re-joins (refresh lost the ticket)", async () => {
+  // F(hub peerid ticket recovery): the proof gate — an unproven duplicate
+  // (no ticket, or a wrong ticket) gets 409 retry_proof_required with
+  // neither the ticket nor the roomId in the body, no joinedAt refresh, and
+  // no second queue entry.
+  it("does not hand the waiting ticket to a caller that only knows the peerId", async () => {
     const first = await join("tictactoe", "peer-dup", "gd1", "Dup")
     const firstBody = (await first.json()) as { status: string; ticket: string; roomId: string }
     expect(firstBody.status).toBe("waiting")
 
-    const second = await join("tictactoe", "peer-dup", "gd1", "Dup")
-    const secondBody = (await second.json()) as { status: string; ticket: string; roomId: string }
-    expect(secondBody.status).toBe("waiting")
-    expect(secondBody.ticket).toMatch(/^[0-9a-f]{32}$/)
-    expect(secondBody.ticket).not.toBe(firstBody.ticket)
-    expect(secondBody.roomId).not.toBe(firstBody.roomId)
+    // A caller that knows the peerId (it travels to the opponent in the
+    // match payload) but presents no ticket must not walk away with — or
+    // even disturb — the live entry.
+    const stolen = await join("tictactoe", "peer-dup", "gd1-different", "Dup2")
+    expect(stolen.status).toBe(409)
+    const stolenBody = (await stolen.json()) as Record<string, unknown>
+    expect(stolenBody.code).toBe("retry_proof_required")
+    expect(JSON.stringify(stolenBody)).not.toContain(firstBody.ticket)
+    expect(JSON.stringify(stolenBody)).not.toContain(firstBody.roomId)
 
-    expect((await poll("tictactoe", firstBody.ticket)).status).toBe(404)
-    const live = (await (await poll("tictactoe", secondBody.ticket)).json()) as { status: string }
-    expect(live.status).toBe("waiting")
-    const h = (await (await health("tictactoe")).json()) as { waiting: number }
-    expect(h.waiting).toBe(1)
+    // A wrong-but-plausible ticket is refused the same way, so the refusal is
+    // about proof and not about the field being absent.
+    const wrongProof = await join("tictactoe", "peer-dup", "gd1", "Dup", "0".repeat(32))
+    expect(wrongProof.status).toBe(409)
 
-    await leave("tictactoe", secondBody.ticket)
+    // The refused attempts must not have created a second queue entry, and
+    // must not have pinned the victim's entry open.
+    const h = await health("tictactoe")
+    const hBody = (await h.json()) as { waiting: number }
+    expect(hBody.waiting).toBe(1)
   })
 
   it("discloses nothing to a stranger who re-joins with a known peerId or guestId (A-02)", async () => {
     // peerId and guestId reach every opponent in the match payload, so neither
-    // may act as a bearer credential for the victim's live ticket.
+    // may act as a bearer credential for the victim's live ticket. The peerId
+    // leg is now the STRONGER proof-gate refusal (F: hub peerid ticket
+    // recovery): 409, nothing disclosed, and the victim's entry is not even
+    // superseded — a stranger cannot cancel it by re-joining. The guestId leg
+    // keeps the supersede semantics: a fresh address with a known guestId
+    // replaces the entry but discloses nothing of the victim's.
     for (const known of ["peerId", "guestId"] as const) {
       await resetQueue("tictactoe")
       const victim = await join("tictactoe", "peer-victim", "g-victim", "Victim")
@@ -428,11 +461,19 @@ describe("MatchmakingQueues via worker fetch", () => {
           ? await join("tictactoe", "peer-victim", "g-attacker", "Attacker")
           : await join("tictactoe", "peer-attacker", "g-victim", "Attacker")
       const text = await attacker.text()
-      expect(JSON.parse(text).status).toBe("waiting")
       expect(text).not.toContain(victimBody.ticket)
       expect(text).not.toContain(victimBody.roomId)
-      // The victim's old ticket is superseded, not handed to anybody.
-      expect((await poll("tictactoe", victimBody.ticket)).status).toBe(404)
+
+      if (known === "peerId") {
+        expect(JSON.parse(text).code).toBe("retry_proof_required")
+        // The victim's entry survives the stranger's attempt untouched.
+        const victimPoll = await poll("tictactoe", victimBody.ticket)
+        expect(victimPoll.status).toBe(200)
+      } else {
+        expect(JSON.parse(text).status).toBe("waiting")
+        // The victim's old ticket is superseded, not handed to anybody.
+        expect((await poll("tictactoe", victimBody.ticket)).status).toBe(404)
+      }
     }
   })
 
@@ -443,6 +484,44 @@ describe("MatchmakingQueues via worker fetch", () => {
     }
     const h = (await (await health("tictactoe")).json()) as { waiting: number }
     expect(h.waiting).toBe(1)
+  })
+
+  it("returns the existing ticket when a genuine retry re-presents it", async () => {
+    const first = await join("tictactoe", "peer-retry", "gr1", "Retry")
+    const firstBody = (await first.json()) as { status: string; ticket: string; roomId: string }
+    expect(firstBody.status).toBe("waiting")
+
+    // The owner lost the join response but still holds the ticket. This is the
+    // idempotent retry the one-entry-per-peerId guard exists for.
+    const retry = await join("tictactoe", "peer-retry", "gr1", "Retry", firstBody.ticket)
+    expect(retry.status).toBe(200)
+    const retryBody = (await retry.json()) as { status: string; ticket: string; roomId: string }
+    expect(retryBody.status).toBe("waiting")
+    expect(retryBody.ticket).toBe(firstBody.ticket)
+    expect(retryBody.roomId).toBe(firstBody.roomId)
+
+    // Still one entry, and the proven retry refreshed its clock.
+    const h = await health("tictactoe")
+    const hBody = (await h.json()) as { waiting: number }
+    expect(hBody.waiting).toBe(1)
+
+    // The recovered ticket still works for polling, so the retry is not just
+    // an echo — the player can carry on waiting for a match.
+    const polled = await poll("tictactoe", retryBody.ticket)
+    expect(polled.status).toBe(200)
+
+    await leave("tictactoe", firstBody.ticket)
+  })
+
+  it("rejects an oversized retryTicket before it reaches the credential check", async () => {
+    const first = await join("tictactoe", "peer-bounds", "gb1", "Bounds")
+    const firstBody = (await first.json()) as { status: string; ticket: string }
+    expect(firstBody.status).toBe("waiting")
+
+    const tooLong = await join("tictactoe", "peer-bounds", "gb1", "Bounds", "a".repeat(65))
+    expect(tooLong.status).toBe(400)
+
+    await leave("tictactoe", firstBody.ticket)
   })
 
   it("sanitizes display names (strips HTML chars and control chars)", async () => {
