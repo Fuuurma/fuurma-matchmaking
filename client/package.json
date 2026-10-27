@@ -1,0 +1,25 @@
+{
+  "name": "@fuurma/online-client",
+  "version": "0.1.0",
+  "description": "Shared Tier-1 online client SDK for fuurma turn-based games (room socket, matchmaking HTTP, identity, room codes, presence). Framework-free, no runtime dependencies.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check src test",
+    "test": "vitest run --project online-client"
+  },
+  "peerDependencies": {},
+  "dependencies": {}
+}

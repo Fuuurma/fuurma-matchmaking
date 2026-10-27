@@ -7,6 +7,7 @@ import {
   MAX_GUEST_ID_LENGTH,
   MAX_MESSAGE_BYTES,
   sanitizeDisplayName,
+  secretsMatch,
   utf8ByteLength,
 } from "./utils"
 
@@ -220,6 +221,9 @@ export class GameRoomDO extends DurableObject {
     if (request.method === "POST" && url.pathname === "/expect") {
       return this.handleExpect(request)
     }
+    if (request.method === "POST" && url.pathname === "/cancel") {
+      return this.handleCancel(request)
+    }
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket upgrade", {
         status: 426,
@@ -348,7 +352,9 @@ export class GameRoomDO extends DurableObject {
 
     slot.disconnectedAt = Date.now()
     await this.saveState(state)
-    await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS)
+    // Not a raw setAlarm(now + grace): that pushed an earlier slot's reap (or a
+    // pending hello's 10 s deadline) out to this slot's later deadline (A-14).
+    await this.scheduleRoomAlarm(state)
 
     this.broadcastExcept(ws, {
       type: "peer-left",
@@ -566,6 +572,39 @@ export class GameRoomDO extends DurableObject {
     return jsonResponse({ ok: true })
   }
 
+  /**
+   * A matched player cancelled on the matchmaking side (A-13). The match is
+   * dead: retire the allocation and tell every other seated socket the room is
+   * closed, so a peer that already connected stops waiting out the seat
+   * deadline. Same internal-only reach as /expect.
+   */
+  private async handleCancel(request: Request): Promise<Response> {
+    const guestId = ((await request.json().catch(() => null)) as { guestId?: unknown } | null)
+      ?.guestId
+    if (typeof guestId !== "string" || guestId.length < 1 || guestId.length > MAX_GUEST_ID_LENGTH) {
+      return jsonResponse({ error: "guestId required" }, 400)
+    }
+    const state = await this.loadState()
+    const sockets = this.ctx.getWebSockets()
+    if (state.expected) {
+      delete state.expected
+      await this.saveState(state)
+    }
+    for (const ws of sockets) {
+      const att = ws.deserializeAttachment() as RoomAttachment | null
+      if (!att || isPendingConnection(att) || att.guestId === guestId) continue
+      this.safeSend(ws, JSON.stringify({ type: "peer-left", reason: "closed" }))
+    }
+    if (state.slots.length === 0 && sockets.length === 0) {
+      // Nothing left to keep: same hygiene as the alarm's fully-retired branch.
+      await this.ctx.storage.delete(ROOM_STATE_KEY)
+      await this.ctx.storage.deleteAlarm()
+    } else {
+      await this.scheduleRoomAlarm(state)
+    }
+    return jsonResponse({ ok: true })
+  }
+
   private async handleHello(
     ws: WebSocket,
     msg: {
@@ -653,7 +692,7 @@ export class GameRoomDO extends DurableObject {
         ws.close(1008, "reconnect rejected")
         return
       }
-      if (presented !== existing.reconnectToken) {
+      if (presented === null || !secretsMatch(presented, existing.reconnectToken)) {
         this.sendError(ws, "invalid", "reconnect credential required")
         ws.close(1008, "reconnect rejected")
         return
@@ -671,7 +710,7 @@ export class GameRoomDO extends DurableObject {
       const expected = state.expected?.[msg.guestId]
       if (state.expected) {
         const presented = typeof msg.slotToken === "string" ? msg.slotToken : null
-        if (!expected || presented !== expected.token) {
+        if (!expected || presented === null || !secretsMatch(presented, expected.token)) {
           this.sendError(ws, "invalid", "join capability required")
           ws.close(1008, "join refused")
           return
@@ -685,8 +724,18 @@ export class GameRoomDO extends DurableObject {
 
       let role: "host" | "guest" =
         expected?.role ?? requestedRole ?? (state.slots.length === 0 ? "host" : "guest")
-      // If the requested role is already taken, fall back to the other one.
       const takenRoles = new Set(state.slots.map((s) => s.role))
+      // A caller that NAMED a role in an open room wants exactly that seat. Seating
+      // it as the other role announced a stranger to the real holder and ended the
+      // room when the "guest" left, so refuse before welcome (and before any
+      // peer-joined). An allocated room is decided by the slotToken, not the hint;
+      // a hello naming no role keeps first-come seating below.
+      if (!expected && requestedRole && takenRoles.has(requestedRole)) {
+        this.sendError(ws, "role-taken", "That room code is already in use")
+        ws.close(1008, "role taken")
+        return
+      }
+      // No role named: if first-come lands on a taken seat, take the other one.
       if (takenRoles.has(role)) {
         role = role === "host" ? "guest" : "host"
       }
@@ -749,6 +798,9 @@ export class GameRoomDO extends DurableObject {
     const str = JSON.stringify(msg)
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === except) continue
+      // A socket that has not said hello is not a player yet (A-15).
+      const att = ws.deserializeAttachment() as RoomAttachment | null
+      if (!att || isPendingConnection(att)) continue
       this.safeSend(ws, str)
     }
   }

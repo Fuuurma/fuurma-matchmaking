@@ -56,7 +56,7 @@ Shared Cloudflare Worker for quick matchmaking and WebSocket room relay for the 
 
 ## Stack
 
-- **Runtime**: Cloudflare Workers (`compatibility_date: 2026-07-21`, `nodejs_compat`)
+- **Runtime**: Cloudflare Workers (`compatibility_date: 2026-07-21`, no compatibility flags)
 - **Durable Objects**: `MatchmakingQueues` (per-game queue state) and `GameRoomDO` (per-room WebSocket relay)
 - **Language**: TypeScript (strict) via `wrangler`
 - **Testing**: Vitest + `@cloudflare/vitest-pool-workers`

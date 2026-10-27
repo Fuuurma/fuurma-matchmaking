@@ -10,6 +10,7 @@ import {
   MAX_GUEST_ID_LENGTH,
   MAX_JSON_BODY_BYTES,
   MAX_PEER_ID_LENGTH,
+  MAX_TICKET_LENGTH,
   sanitizeDisplayName,
   utf8ByteLength,
 } from "./utils"
@@ -21,6 +22,15 @@ export interface MatchmakingRequest {
   peerId: string
   displayName?: string
   guestId?: string
+  /**
+   * Proof that a duplicate join is the same client that created the existing
+   * queue entry. `peerId` alone is not enough: it is disclosed to the opponent
+   * in the match payload, so anyone holding a matched player's peerId could
+   * otherwise call join and be handed that player's live waiting ticket — a
+   * bearer credential for poll/leave. Clients present the ticket they already
+   * hold; a caller who cannot produce it is not the owner and gets nothing.
+   */
+  retryTicket?: string
 }
 
 export interface Match {
@@ -50,6 +60,12 @@ type MatchWithRole = Match & { role: "host" | "guest"; game: string; createdAt: 
 type MatchRecord = MatchWithRole & {
   slots?: { host: string; guest: string }
   slotsBound?: boolean
+  /**
+   * When the ticket first collected `matched`. The record then lingers only a
+   * short tombstone (a retried poll still gets its answer) instead of the full
+   * match window (A-06/A-07).
+   */
+  collectedAt?: number
 }
 
 interface Player {
@@ -67,19 +83,31 @@ interface Player {
    * persisted before this field existed fall back to `joinedAt`.
    */
   createdAt?: number
+  /** Client address at join time; bounds how many live entries one address holds. */
+  ip?: string
 }
 
 interface QueueState {
   queues: Record<string, Player[]>
   matches: Record<string, MatchRecord>
-  rateLimits?: Record<string, { count: number; windowStartedAt: number }>
+  /** Persisted by earlier builds; dropped on load — the counters live in memory now. */
+  rateLimits?: unknown
 }
 
 const QUEUE_KEY = "queue-state"
 const QUEUE_TIMEOUT_MS = 30_000
 const MAX_TICKET_AGE_MS = 600_000
 const MAX_QUEUE_LENGTH = 100
-const MATCH_TIMEOUT_MS = 300_000
+const MAX_ENTRIES_PER_IP = 3
+/**
+ * A queued player pairs only if it was seen this recently. Gambit polls every
+ * 500 ms and tic-tac-toe at most every 4 s, so 10 s is two slow intervals; the
+ * 30 s TTL alone left a closed tab matchable for up to 30 s (A-05).
+ */
+const PAIRING_FRESHNESS_MS = 10_000
+const MATCH_TIMEOUT_MS = 90_000
+const COLLECTED_MATCH_TTL_MS = 15_000
+const MAX_MATCH_RECORDS = 400
 const JOIN_RATE_WINDOW_MS = 60_000
 const MAX_JOIN_ATTEMPTS_PER_WINDOW = 20
 const MAX_RATE_LIMIT_ENTRIES = 512
@@ -92,14 +120,17 @@ function isLiveTicket(p: Player, now: number): boolean {
 }
 
 /**
- * Drop match records whose match window has elapsed. Mutates `state` and
+ * Drop match records whose match window has elapsed, or whose tombstone has
+ * (a collected record only lingers COLLECTED_MATCH_TTL_MS). Mutates `state` and
  * reports whether anything was removed, so the caller decides whether the
  * pruned state still needs persisting.
  */
 function pruneExpiredMatches(state: QueueState, now: number): boolean {
   let changed = false
   for (const [ticket, match] of Object.entries(state.matches)) {
-    if (now - match.createdAt > MATCH_TIMEOUT_MS) {
+    const tombstoneOver =
+      match.collectedAt !== undefined && now - match.collectedAt > COLLECTED_MATCH_TTL_MS
+    if (tombstoneOver || now - match.createdAt > MATCH_TIMEOUT_MS) {
       delete state.matches[ticket]
       changed = true
     }
@@ -107,7 +138,37 @@ function pruneExpiredMatches(state: QueueState, now: number): boolean {
   return changed
 }
 
+/** Keeps the persisted blob bounded under a burst of matches: oldest records go first. */
+function capMatchRecords(state: QueueState): void {
+  const tickets = Object.keys(state.matches)
+  if (tickets.length <= MAX_MATCH_RECORDS) return
+  tickets.sort((a, b) => state.matches[a].createdAt - state.matches[b].createdAt)
+  for (const ticket of tickets.slice(0, tickets.length - MAX_MATCH_RECORDS)) {
+    delete state.matches[ticket]
+  }
+}
+
 export class MatchmakingQueues extends DurableObject {
+  /**
+   * Join counters per address, in memory only. shortcut: a DO restart (eviction,
+   * deploy) resets them, which only hands out a fresh window; persisting them
+   * rewrote the whole queue blob on every join. Upgrade to a Rate Limiting
+   * binding if the counters must survive restarts.
+   */
+  private joinCounters = new Map<string, { count: number; windowStartedAt: number }>()
+
+  /**
+   * When each queued ticket was last seen (join or poll). In memory only: the
+   * persisted `joinedAt` is refreshed at most every 15 s, far too coarse, and a
+   * write per poll would be a lot of traffic. After a DO restart a ticket falls
+   * back to `joinedAt`, so it can be skipped until its next poll (<= 4 s).
+   */
+  private lastSeen = new Map<string, number>()
+
+  private isFresh(p: Player, now: number): boolean {
+    return now - (this.lastSeen.get(p.ticket) ?? p.joinedAt) < PAIRING_FRESHNESS_MS
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const path = url.pathname
@@ -141,7 +202,7 @@ export class MatchmakingQueues extends DurableObject {
         if (!isValidTicket(ticket)) {
           return jsonResponse({ error: "valid ticket required" }, 400)
         }
-        return this.handlePoll(game, ticket)
+        return await this.handlePoll(game, ticket)
       }
 
       if (request.method === "POST" && action === "leave") {
@@ -154,24 +215,27 @@ export class MatchmakingQueues extends DurableObject {
         if (typeof ticket !== "string" || !isValidTicket(ticket)) {
           return jsonResponse({ error: "valid ticket required" }, 400)
         }
-        return this.handleLeave(game, ticket)
+        return await this.handleLeave(game, ticket)
       }
 
       if (request.method === "GET" && action === "health") {
-        return this.handleHealth(game)
+        return await this.handleHealth(game)
       }
 
       return jsonResponse({ error: "not found" }, 404)
     } catch (err) {
-      const message = err instanceof Error ? err.message : "server error"
+      // The cause goes to the log; the client only learns that it failed.
+      const message = err instanceof Error ? err.message : String(err)
       logEvent("error", "matchmaking_request_failed", { game, action, message })
-      return jsonResponse({ error: message }, 500)
+      return jsonResponse({ error: "server error" }, 500)
     }
   }
 
   private async loadState(): Promise<QueueState> {
     const stored = await this.ctx.storage.get<QueueState>(QUEUE_KEY)
-    return stored ?? { queues: {}, matches: {} }
+    if (!stored) return { queues: {}, matches: {} }
+    delete stored.rateLimits
+    return stored
   }
 
   private async saveState(state: QueueState): Promise<void> {
@@ -218,6 +282,14 @@ export class MatchmakingQueues extends DurableObject {
     ) {
       return jsonResponse({ error: `guestId must be 1-${MAX_GUEST_ID_LENGTH} chars` }, 400)
     }
+    if (
+      req.retryTicket !== undefined &&
+      (typeof req.retryTicket !== "string" ||
+        req.retryTicket.length < 1 ||
+        req.retryTicket.length > MAX_TICKET_LENGTH)
+    ) {
+      return jsonResponse({ error: `retryTicket must be 1-${MAX_TICKET_LENGTH} chars` }, 400)
+    }
     if (req.displayName !== undefined) {
       if (typeof req.displayName !== "string") {
         return jsonResponse({ error: "displayName must be a string" }, 400)
@@ -238,13 +310,9 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     const now = Date.now()
-    const state = await this.loadState()
-    const rateLimit = await this.consumeJoinAttempt(state, request, now)
+    const rateLimit = this.consumeJoinAttempt(request, now)
     if (rateLimit) return rateLimit
-
-    // Prune expired queue entries and matches in one pass.
-    const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
-    pruneExpiredMatches(state, now)
+    const state = await this.loadState()
 
     const ticket = generateTicket()
     const roomId = generateRoomId()
@@ -257,36 +325,85 @@ export class MatchmakingQueues extends DurableObject {
       guestId: req.guestId ?? crypto.randomUUID(),
       joinedAt: now,
       createdAt: now,
+      ip: clientIp(request),
     }
 
-    // Guard: one active queue entry per peerId. If the same player re-joins
-    // (e.g. lost their ticket and retried), return their existing waiting
-    // ticket instead of creating a duplicate queue entry. Refresh joinedAt
-    // so the 30s queue timeout resets on each rejoin attempt.
+    // Prune expired matches and queue entries, and drop any live entry of the
+    // same player. A repeat join (known peerId OR guestId — a refresh that lost
+    // the ticket) SUPERSEDES the old entry with a fresh ticket and roomId. The
+    // stored ticket is never handed back: peerId and guestId reach every
+    // opponent in the match payload, so answering with the ticket let anyone who
+    // knew one take over or cancel that player's search (A-02). It also keeps
+    // the queue to one entry per guestId, so one client cannot fill it (A-03).
+    // Residual: whoever knows a peerId can cancel that player's search by
+    // re-joining, bounded by the join rate limit.
+    pruneExpiredMatches(state, now)
+
+    // One active queue entry per peerId. A genuine retry (the response was
+    // lost, the client still holds its ticket) must not create a duplicate
+    // entry, so it gets the existing one back. But `peerId` is not a secret —
+    // it travels to the opponent inside the match payload — so it cannot by
+    // itself authorize handing out the waiting ticket, which is a bearer
+    // credential for poll/leave. The caller has to prove ownership by
+    // presenting the ticket the server issued. Without it we neither return
+    // the ticket nor touch `joinedAt`: refreshing on an unproven call would
+    // let a stranger pin a victim's queue entry open indefinitely. The real
+    // owner keeps their own entry alive by polling (handlePoll), so refusing
+    // the refresh costs them nothing. (F: hub peerid ticket recovery)
+    const ownLiveEntry = (state.queues[game] ?? []).find(
+      (p) => p.peerId === player.peerId && isLiveTicket(p, now),
+    )
+    if (ownLiveEntry) {
+      if (req.retryTicket !== ownLiveEntry.ticket) {
+        logEvent("warn", "duplicate_join_rejected_unproven", {
+          game,
+          peerId: player.peerId.slice(0, 8),
+          presented: req.retryTicket === undefined ? "none" : "mismatch",
+        })
+        return jsonResponse(
+          {
+            error: "already queued",
+            code: "retry_proof_required",
+            detail: "Re-present the waiting ticket to recover this queue entry.",
+          },
+          409,
+        )
+      }
+      ownLiveEntry.joinedAt = now
+      this.lastSeen.set(ownLiveEntry.ticket, now)
+      await this.saveState(state)
+      return jsonResponse({
+        status: "waiting",
+        ticket: ownLiveEntry.ticket,
+        roomId: ownLiveEntry.roomId,
+      })
+    }
+
+    const queue = (state.queues[game] ?? []).filter(
+      (p) => isLiveTicket(p, now) && p.peerId !== player.peerId && p.guestId !== player.guestId,
+    )
+
     if (queue.length >= MAX_QUEUE_LENGTH) {
       return jsonResponse({ error: "queue full — retry shortly" }, 503, {
         "Retry-After": "30",
       })
     }
-
-    const existingEntry = queue.find((p) => p.peerId === player.peerId)
-    if (existingEntry) {
-      existingEntry.joinedAt = now
-      state.queues[game] = queue
-      await this.saveState(state)
-      logEvent("warn", "duplicate_join_returned_existing", {
-        game,
-        peerId: player.peerId.slice(0, 8),
-      })
-      return jsonResponse({
-        status: "waiting",
-        ticket: existingEntry.ticket,
-        roomId: existingEntry.roomId,
+    // Entries only pile up unpaired, so 3 per address still lets a shared NAT
+    // play (its players pair with each other) while one address cannot hold the
+    // queue. Checked before pairing, like the cap above (A-03).
+    if (queue.filter((p) => p.ip === player.ip).length >= MAX_ENTRIES_PER_IP) {
+      return jsonResponse({ error: "too many active searches from this address" }, 429, {
+        "Retry-After": "30",
       })
     }
 
-    const opponent = queue.find((p) => p.guestId !== player.guestId && p.peerId !== player.peerId)
+    // Only ticket-holders still in the queue need a lastSeen entry.
+    for (const t of this.lastSeen.keys()) {
+      if (!queue.some((p) => p.ticket === t)) this.lastSeen.delete(t)
+    }
+    const opponent = queue.find((p) => this.isFresh(p, now))
     if (opponent) {
+      this.lastSeen.delete(opponent.ticket)
       state.queues[game] = queue.filter((p) => p.ticket !== opponent.ticket)
       const match: Match = {
         roomId: opponent.roomId,
@@ -309,6 +426,7 @@ export class MatchmakingQueues extends DurableObject {
       const slots = { host: generateTicket(), guest: generateTicket() }
       state.matches[opponent.ticket] = { ...matchWithRole, role: "host", slots }
       state.matches[player.ticket] = { ...matchWithRole, role: "guest", slots }
+      capMatchRecords(state)
       await this.saveState(state)
       const bound = await this.bindRoomSlots(match.roomId, match, slots)
       if (!bound) {
@@ -318,9 +436,29 @@ export class MatchmakingQueues extends DurableObject {
         // reopen the pre-claim hole this commit exists to close.
         return jsonResponse({ status: "waiting", ticket, roomId })
       }
-      state.matches[opponent.ticket].slotsBound = true
-      state.matches[player.ticket].slotsBound = true
-      await this.saveState(state)
+      // The bind await opened the input gate: polls, leaves and other joins ran
+      // against storage while this request waited, so `state` is stale and
+      // saving it would undo their writes (A-01). Re-read and touch only the
+      // match records, and only those that still exist.
+      const current = await this.loadState()
+      const hostRecord = current.matches[opponent.ticket]
+      if (hostRecord) hostRecord.slotsBound = true
+      if (!current.matches[player.ticket]) {
+        // The host left while the room was binding (F39): honour it. Queue the
+        // joiner as a fresh arrival rather than announcing a match with nobody.
+        // shortcut: not re-paired against others queued meanwhile, so it waits
+        // for the next join; upgrade if pairing ever moves off join time.
+        const live = (current.queues[game] ?? []).filter((p) => isLiveTicket(p, Date.now()))
+        current.queues[game] = [...live, player]
+        this.lastSeen.set(ticket, Date.now())
+        await this.saveState(current)
+        return jsonResponse({ status: "waiting", ticket, roomId })
+      }
+      // The joiner collects its match in this very response and never learns its
+      // ticket, so nothing can poll that record: drop it now (A-07). The host's
+      // record stays until the host collects.
+      delete current.matches[player.ticket]
+      await this.saveState(current)
       return jsonResponse({
         status: "matched",
         match: { ...match, role: "guest", game, createdAt: now },
@@ -329,36 +467,28 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     state.queues[game] = [...queue, player]
+    this.lastSeen.set(ticket, now)
     await this.saveState(state)
     return jsonResponse({ status: "waiting", ticket, roomId })
   }
 
-  private async consumeJoinAttempt(
-    state: QueueState,
-    request: Request,
-    now: number,
-  ): Promise<Response | null> {
-    const ip =
-      request.headers.get("CF-Connecting-IP") ??
-      request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
-      "unknown"
-    const rateLimits = state.rateLimits ?? {}
-    for (const [key, entry] of Object.entries(rateLimits)) {
-      if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) delete rateLimits[key]
+  private consumeJoinAttempt(request: Request, now: number): Response | null {
+    const ip = clientIp(request)
+    const counters = this.joinCounters
+    for (const [key, entry] of counters) {
+      if (now - entry.windowStartedAt >= JOIN_RATE_WINDOW_MS) counters.delete(key)
     }
     // Bound the map's high-cardinality tail: past the cap, drop the oldest
     // windows. Bounded pruning work, and worst case an evicted IP's counter
     // simply restarts — it does not widen anyone's allowance.
-    const keys = Object.keys(rateLimits)
-    if (keys.length > MAX_RATE_LIMIT_ENTRIES) {
-      const oldestFirst = keys
-        .map((key) => [key, rateLimits[key].windowStartedAt] as const)
-        .sort((a, b) => a[1] - b[1])
-        .slice(0, keys.length - MAX_RATE_LIMIT_ENTRIES)
-      for (const [key] of oldestFirst) delete rateLimits[key]
+    if (counters.size > MAX_RATE_LIMIT_ENTRIES) {
+      const oldestFirst = [...counters].sort((a, b) => a[1].windowStartedAt - b[1].windowStartedAt)
+      for (const [key] of oldestFirst.slice(0, counters.size - MAX_RATE_LIMIT_ENTRIES)) {
+        counters.delete(key)
+      }
     }
 
-    const current = rateLimits[ip]
+    const current = counters.get(ip)
     if (current && now - current.windowStartedAt < JOIN_RATE_WINDOW_MS) {
       if (current.count >= MAX_JOIN_ATTEMPTS_PER_WINDOW) {
         return jsonResponse({ error: "too many join attempts" }, 429, {
@@ -369,11 +499,8 @@ export class MatchmakingQueues extends DurableObject {
       }
       current.count += 1
     } else {
-      rateLimits[ip] = { count: 1, windowStartedAt: now }
+      counters.set(ip, { count: 1, windowStartedAt: now })
     }
-
-    state.rateLimits = rateLimits
-    await this.saveState(state)
     return null
   }
 
@@ -389,29 +516,56 @@ export class MatchmakingQueues extends DurableObject {
     slots: { host: string; guest: string },
   ): Promise<boolean> {
     try {
-      const stub = this.env.GAME_ROOM.get(this.env.GAME_ROOM.idFromName(roomId))
-      const res = await stub.fetch(
-        new Request("https://room.internal/expect", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            slots: [
-              { guestId: match.host.guestId, token: slots.host, role: "host" },
-              { guestId: match.guest.guestId, token: slots.guest, role: "guest" },
-            ],
-          }),
-        }),
-      )
+      const res = await this.postToRoom(roomId, "expect", {
+        slots: [
+          { guestId: match.host.guestId, token: slots.host, role: "host" },
+          { guestId: match.guest.guestId, token: slots.guest, role: "guest" },
+        ],
+      })
       return res.ok
     } catch {
       return false
     }
   }
 
+  /** Internal POST to a room DO. Publicly unreachable: the Worker only forwards GET /room upgrades. */
+  private postToRoom(roomId: string, action: "expect" | "cancel", payload: unknown) {
+    const stub = this.env.GAME_ROOM.get(this.env.GAME_ROOM.idFromName(roomId))
+    return stub.fetch(
+      new Request(`https://room.internal/${action}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    )
+  }
+
+  /**
+   * A matched player cancelled: tell the room so the seated opponent hears
+   * `peer-left closed` now instead of waiting out the 60 s seat deadline (A-13).
+   * Best effort — the leave itself must succeed even if the room is unreachable.
+   * shortcut: only while the leaver's match record exists (<= 90 s, or 15 s
+   * after it collected); a later leave leaves the room to its own deadlines.
+   */
+  private async releaseRoom(match: MatchRecord): Promise<void> {
+    const leaver = match.role === "host" ? match.host.guestId : match.guest.guestId
+    try {
+      await this.postToRoom(match.roomId, "cancel", { guestId: leaver })
+    } catch (err) {
+      logEvent("warn", "room_release_failed", {
+        game: match.game,
+        message: err instanceof Error ? err.message : "unknown",
+      })
+    }
+  }
+
   private async handlePoll(game: string, ticket: string): Promise<Response> {
-    const matches = await this.getMatches()
-    const match = matches[ticket]
+    const now = Date.now()
+    let state = await this.loadState()
+    if (pruneExpiredMatches(state, now)) await this.saveState(state)
+    const match = state.matches[ticket]
     if (match) {
+      let dirty = false
       // Records persisted before the slot-capability deploy carry no `slots`
       // — treat them as open-mode (the room was never allocated) rather than
       // stalling them behind a binding that can never exist.
@@ -420,29 +574,36 @@ export class MatchmakingQueues extends DurableObject {
         if (!bound) {
           return jsonResponse({ status: "waiting", ticket, roomId: match.roomId })
         }
-        const state = await this.loadState()
-        const stored = state.matches[ticket]
-        if (stored) {
-          stored.slotsBound = true
-          await this.saveState(state)
-        }
+        // Re-read: the bind await let a leave or a prune delete this record,
+        // and a match that no longer exists must not be disclosed (A-01).
+        state = await this.loadState()
+        if (!state.matches[ticket]) return jsonResponse({ error: "ticket not found" }, 404)
+        state.matches[ticket].slotsBound = true
+        dirty = true
       }
-      const { slots, slotsBound, ...pub } = match
+      const record = state.matches[ticket]
+      // First collection starts the short tombstone: a retried poll still gets
+      // its answer, but the record no longer lingers for the full window (A-07).
+      if (record.collectedAt === undefined) {
+        record.collectedAt = now
+        dirty = true
+      }
+      if (dirty) await this.saveState(state)
+      const { slots, slotsBound, collectedAt, ...pub } = record
       return jsonResponse({
         status: "matched",
         match: pub,
-        ...(slots ? { slotToken: slots[match.role] } : {}),
+        ...(slots ? { slotToken: slots[record.role] } : {}),
       })
     }
 
-    const now = Date.now()
-    const state = await this.loadState()
     const queue = (state.queues[game] ?? []).filter((p) => isLiveTicket(p, now))
     const player = queue.find((p) => p.ticket === ticket)
     if (!player) {
       return jsonResponse({ error: "ticket not found" }, 404)
     }
 
+    this.lastSeen.set(ticket, now)
     // Refresh joinedAt on each poll so actively-polling players don't
     // time out. The 30s queue timeout is for cleaning up abandoned
     // entries, not for limiting how long someone can wait for a match.
@@ -457,6 +618,7 @@ export class MatchmakingQueues extends DurableObject {
 
   private async handleLeave(game: string, ticket: string): Promise<Response> {
     const now = Date.now()
+    this.lastSeen.delete(ticket)
     const state = await this.loadState()
 
     const queue = state.queues[game] ?? []
@@ -483,17 +645,26 @@ export class MatchmakingQueues extends DurableObject {
     }
 
     await this.saveState(state)
+    // After the save, so the room round trip (which opens the input gate) cannot
+    // make this request act on stale state.
+    if (match) await this.releaseRoom(match)
     return jsonResponse({ status: "left" })
   }
 
   private async handleHealth(game: string): Promise<Response> {
     const queue = await this.getQueue(game)
-    const matches = Object.values(await this.getMatches()).filter((m) => m.game === game)
+    // A match is one room, however many ticket records still reference it.
+    const rooms = new Set(
+      Object.values(await this.getMatches())
+        .filter((m) => m.game === game)
+        .map((m) => m.roomId),
+    )
     return jsonResponse({
       ok: true,
       game,
       waiting: queue.length,
-      matches: matches.length,
+      matches: rooms.size,
+      players: queue.length + 2 * rooms.size,
     })
   }
 }
@@ -512,9 +683,11 @@ export default {
       if (!isValidRoomId(roomId)) {
         return jsonResponse({ error: "invalid room id" }, 400)
       }
-      const id = env.GAME_ROOM.idFromName(roomId)
-      const stub = env.GAME_ROOM.get(id)
-      return stub.fetch(request)
+      try {
+        return await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId)).fetch(request)
+      } catch (err) {
+        return unavailable("room", err)
+      }
     }
 
     if (request.method === "OPTIONS") {
@@ -531,9 +704,13 @@ export default {
       return jsonResponse({ error: "unknown game" }, 400)
     }
 
-    const id = env.MATCHMAKING_QUEUES.idFromName(game)
-    const stub = env.MATCHMAKING_QUEUES.get(id)
-    const response = await stub.fetch(request)
+    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+    let response: Response
+    try {
+      response = await stub.fetch(request)
+    } catch (err) {
+      return unavailable("queue", err)
+    }
 
     // Inject wsUrl into matched responses so the client can connect directly.
     const contentType = response.headers.get("Content-Type") ?? ""
@@ -572,6 +749,27 @@ export default {
 
     return response
   },
+}
+
+function clientIp(request: Request): string {
+  return (
+    request.headers.get("CF-Connecting-IP") ??
+    request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ??
+    "unknown"
+  )
+}
+
+/**
+ * A Durable Object that is overloaded or resetting makes `stub.fetch` throw;
+ * without this the client gets Cloudflare's HTML error page and its JSON parse
+ * fails confusingly (A-11). The cause is logged, never returned.
+ */
+function unavailable(route: "queue" | "room", err: unknown): Response {
+  logEvent("error", "durable_object_unavailable", {
+    route,
+    message: err instanceof Error ? err.message : String(err),
+  })
+  return jsonResponse({ error: "temporarily unavailable" }, 503, { "Retry-After": "5" })
 }
 
 function buildWsUrl(requestUrl: string, roomId: string): string {

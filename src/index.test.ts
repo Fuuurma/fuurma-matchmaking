@@ -1,28 +1,16 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { env, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import worker from "./index"
 
-/**
- * The join rate limiter is keyed on the caller's IP, and every test in this
- * file shares one synthetic client unless it opts out (the dedicated
- * rate-limit test sets its own). That made the suite's pass/fail depend on how
- * many joins happened to run inside a 60s window rather than on the behaviour
- * under test — adding a case could turn unrelated tests into 429s. Key each
- * generic test's bucket on its peerId instead, which is what the limiter is
- * conceptually bounding: one client's join rate. Same-client retries in a
- * single test keep sharing a bucket, so a genuine rate-limit test still sees
- * them accumulate.
- */
-function testIpFor(peerId: string): string {
-  let hash = 0x811c9dc5
-  for (let i = 0; i < peerId.length; i++) {
-    hash ^= peerId.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193) >>> 0
-  }
-  // Spread over two octets inside the TEST-NET-2 block to keep collisions rare.
-  return `198.51.${100 + ((hash >>> 8) % 100)}.${(hash % 254) + 1}`
+// Every join gets its own client address unless a test pins one: the DO keeps
+// ONE per-IP join counter for the whole file, and the suite joins often enough
+// from a shared "unknown" address to trip the 20-per-minute limit.
+let ipCounter = 0
+function nextIp(): string {
+  ipCounter += 1
+  return `198.18.${Math.floor(ipCounter / 256)}.${ipCounter % 256}`
 }
 
 async function join(
@@ -30,8 +18,18 @@ async function join(
   peerId: string,
   guestId: string,
   displayName: string,
-  retryTicket?: string,
+  retryTicketOrIp?: string,
 ) {
+  // Two positional conveniences share the 5th slot: main's IP-pinning tests
+  // pass the address, the proof-gate tests pass the retry ticket. The shape
+  // disambiguates — a dotted quad is the address, anything else the ticket.
+  const isIp =
+    typeof retryTicketOrIp === "string" &&
+    /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(retryTicketOrIp)
+  const ip = isIp
+    ? (retryTicketOrIp as string)
+    : ((retryTicketOrIp ? undefined : nextIp()) ?? nextIp())
+  const ticket = isIp ? undefined : retryTicketOrIp
   const response = await worker.fetch(
     new Request(`https://test.invalid/api/matchmaking/${game}/join`, {
       method: "POST",
@@ -39,9 +37,12 @@ async function join(
         peerId,
         guestId,
         displayName,
-        ...(retryTicket ? { retryTicket } : {}),
+        ...(ticket ? { retryTicket: ticket } : {}),
       }),
-      headers: { "Content-Type": "application/json", "CF-Connecting-IP": testIpFor(peerId) },
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": ip ?? nextIp(),
+      },
     }),
     env,
   )
@@ -69,6 +70,100 @@ async function poll(game: string, ticket: string) {
 async function health(game: string) {
   return worker.fetch(new Request(`https://test.invalid/api/matchmaking/${game}/health`), env)
 }
+
+// The matchmaking -> room handoff (pre-claim fix). A match is only disclosed
+// once the room DO has acknowledged the allocation, and the DO-to-DO `fetch`
+// that does it opens the queue DO's input gate, so other requests interleave
+// with it. These tests park that call (or fail it) on the DO instance to force
+// the interleavings deterministically.
+type Slots = { host: string; guest: string }
+type BindFn = (roomId: string, match: unknown, slots: Slots) => Promise<boolean>
+type Answer = {
+  status: string
+  ticket?: string
+  roomId?: string
+  slotToken?: string
+  match?: { role: string; roomId: string; wsUrl: string } & Record<string, unknown>
+}
+
+const queueStub = (game: string) =>
+  env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+
+async function overrideBind(game: string, fn: BindFn): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = fn
+  })
+}
+
+/** A bind that stays "in flight" until the test releases it. */
+function parkedBind() {
+  let release!: (ok: boolean) => void
+  let enter!: () => void
+  const gate = new Promise<boolean>((resolve) => {
+    release = resolve
+  })
+  const reached = new Promise<void>((resolve) => {
+    enter = resolve
+  })
+  const fn: BindFn = async () => {
+    enter()
+    return gate
+  }
+  return { fn, reached, release }
+}
+
+/**
+ * Sends a request straight to the queue DO from inside it and reads the reply
+ * there. A request parked on a bind answers from the DO's own context, and a
+ * response body created there cannot be read from the test's context (workerd
+ * refuses cross-DO I/O). The Worker's wsUrl rewrite is skipped, which these
+ * tests do not look at.
+ */
+function requestInDo(game: string, path: string, init?: RequestInit) {
+  return runInDurableObject(queueStub(game), async (instance) => {
+    const res = await instance.fetch(
+      new Request(`https://test.invalid/api/matchmaking/${game}/${path}`, init),
+    )
+    return { status: res.status, body: (await res.json()) as Answer }
+  })
+}
+
+/** Puts the real room handoff back (and drops any other replaced room call). */
+async function restoreBind(game: string): Promise<void> {
+  await runInDurableObject(queueStub(game), (instance) => {
+    // Own properties shadow the prototype methods the tests replace.
+    const overridden = instance as unknown as Record<string, unknown>
+    for (const name of ["bindRoomSlots", "postToRoom", "loadState"]) delete overridden[name]
+  })
+}
+
+/** Empties a game's queue DO and drops any bind override a previous test left. */
+async function resetQueue(game: string): Promise<void> {
+  await restoreBind(game)
+  await runInDurableObject(queueStub(game), (_i, state) => state.storage.deleteAll())
+}
+
+async function answer(response: Response): Promise<Answer> {
+  return (await response.json()) as Answer
+}
+
+async function allocation(roomId: string) {
+  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
+  const stored = (await runInDurableObject(stub, (_i, state) => state.storage.get("room-state"))) as
+    | { expected?: Record<string, { token: string; role: string }> }
+    | undefined
+  return stored?.expected
+}
+
+// Each test starts from empty queues; the DOs persist across tests in a file.
+beforeEach(async () => {
+  await resetQueue("tictactoe")
+  await resetQueue("gambit-deck")
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe("MatchmakingQueues via worker fetch", () => {
   it("rejects malformed and oversized join payloads", async () => {
@@ -227,32 +322,29 @@ describe("MatchmakingQueues via worker fetch", () => {
     await leave("tictactoe", hostBody.ticket)
   })
 
-  it("does not pair the same guestId", async () => {
+  it("never pairs a guestId with itself: a repeat join supersedes the old entry", async () => {
     const first = await join("tictactoe", "peer-5", "g5", "Alice")
     const firstBody = (await first.json()) as { status: "waiting"; ticket: string }
     expect(firstBody.status).toBe("waiting")
 
-    // Same guestId, different peerId — should not pair with the first.
+    // Same guestId, different peerId: still one player, so one queue entry.
     const duplicate = await join("tictactoe", "peer-5b", "g5", "Alice2")
     const duplicateBody = (await duplicate.json()) as { status: "waiting"; ticket: string }
     expect(duplicateBody.status).toBe("waiting")
+    expect(duplicateBody.ticket).not.toBe(firstBody.ticket)
+    expect((await poll("tictactoe", firstBody.ticket)).status).toBe(404)
 
-    // A different guest pairs with the first queued player.
+    // A different guest pairs with the surviving entry.
     const other = await join("tictactoe", "peer-6", "g6", "Bob")
     const otherBody = (await other.json()) as {
       status: "matched"
-      match: { host: { guestId: string }; guest: { guestId: string } }
+      match: { host: { guestId: string; peerId: string }; guest: { guestId: string } }
     }
     expect(otherBody.status).toBe("matched")
     expect(otherBody.match.host.guestId).toBe("g5")
+    expect(otherBody.match.host.peerId).toBe("peer-5b")
     expect(otherBody.match.guest.guestId).toBe("g6")
 
-    // The duplicate ticket is still waiting.
-    const pollDuplicate = await poll("tictactoe", duplicateBody.ticket)
-    const pollDuplicateBody = (await pollDuplicate.json()) as { status: string }
-    expect(pollDuplicateBody.status).toBe("waiting")
-
-    await leave("tictactoe", firstBody.ticket)
     await leave("tictactoe", duplicateBody.ticket)
   })
 
@@ -320,14 +412,18 @@ describe("MatchmakingQueues via worker fetch", () => {
     expect(body.error).toBe("unknown game")
   })
 
+  // F(hub peerid ticket recovery): the proof gate — an unproven duplicate
+  // (no ticket, or a wrong ticket) gets 409 retry_proof_required with
+  // neither the ticket nor the roomId in the body, no joinedAt refresh, and
+  // no second queue entry.
   it("does not hand the waiting ticket to a caller that only knows the peerId", async () => {
     const first = await join("tictactoe", "peer-dup", "gd1", "Dup")
     const firstBody = (await first.json()) as { status: string; ticket: string; roomId: string }
     expect(firstBody.status).toBe("waiting")
 
-    // The attacker knows the peerId (it travels to the opponent in the match
-    // payload) and guesses a different guestId. They must not be able to walk
-    // away with the live ticket, which is the bearer credential for poll/leave.
+    // A caller that knows the peerId (it travels to the opponent in the
+    // match payload) but presents no ticket must not walk away with — or
+    // even disturb — the live entry.
     const stolen = await join("tictactoe", "peer-dup", "gd1-different", "Dup2")
     expect(stolen.status).toBe(409)
     const stolenBody = (await stolen.json()) as Record<string, unknown>
@@ -345,8 +441,49 @@ describe("MatchmakingQueues via worker fetch", () => {
     const h = await health("tictactoe")
     const hBody = (await h.json()) as { waiting: number }
     expect(hBody.waiting).toBe(1)
+  })
 
-    await leave("tictactoe", firstBody.ticket)
+  it("discloses nothing to a stranger who re-joins with a known peerId or guestId (A-02)", async () => {
+    // peerId and guestId reach every opponent in the match payload, so neither
+    // may act as a bearer credential for the victim's live ticket. The peerId
+    // leg is now the STRONGER proof-gate refusal (F: hub peerid ticket
+    // recovery): 409, nothing disclosed, and the victim's entry is not even
+    // superseded — a stranger cannot cancel it by re-joining. The guestId leg
+    // keeps the supersede semantics: a fresh address with a known guestId
+    // replaces the entry but discloses nothing of the victim's.
+    for (const known of ["peerId", "guestId"] as const) {
+      await resetQueue("tictactoe")
+      const victim = await join("tictactoe", "peer-victim", "g-victim", "Victim")
+      const victimBody = (await victim.json()) as { ticket: string; roomId: string }
+
+      const attacker =
+        known === "peerId"
+          ? await join("tictactoe", "peer-victim", "g-attacker", "Attacker")
+          : await join("tictactoe", "peer-attacker", "g-victim", "Attacker")
+      const text = await attacker.text()
+      expect(text).not.toContain(victimBody.ticket)
+      expect(text).not.toContain(victimBody.roomId)
+
+      if (known === "peerId") {
+        expect(JSON.parse(text).code).toBe("retry_proof_required")
+        // The victim's entry survives the stranger's attempt untouched.
+        const victimPoll = await poll("tictactoe", victimBody.ticket)
+        expect(victimPoll.status).toBe(200)
+      } else {
+        expect(JSON.parse(text).status).toBe("waiting")
+        // The victim's old ticket is superseded, not handed to anybody.
+        expect((await poll("tictactoe", victimBody.ticket)).status).toBe(404)
+      }
+    }
+  })
+
+  it("keeps one queue entry per guestId however many peerIds it presents (A-03)", async () => {
+    for (let i = 0; i < 30; i += 1) {
+      const res = await join("tictactoe", `flood-peer-${i}`, "flood-guest", "Flood")
+      expect(res.status).toBe(200)
+    }
+    const h = (await (await health("tictactoe")).json()) as { waiting: number }
+    expect(h.waiting).toBe(1)
   })
 
   it("returns the existing ticket when a genuine retry re-presents it", async () => {
@@ -521,54 +658,67 @@ describe("MatchmakingQueues via worker fetch", () => {
   // operation serialized the whole state value, so a grown queue amplified
   // into matchmaking latency for everyone.
   it("refuses the join beyond the per-game queue cap with a retryable 503", async () => {
-    // All joins share one guestId so nothing pairs and the queue fills.
-    // Distinct IPs keep the per-IP join throttle out of the measurement.
-    for (let i = 0; i < 100; i += 1) {
-      const response = await worker.fetch(
-        new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
-          method: "POST",
-          body: JSON.stringify({
+    // One player can no longer fill the queue (one entry per guestId, A-03), so
+    // the 100-entry backstop is reached by seeding live entries directly.
+    const now = Date.now()
+    await runInDurableObject(queueStub("gambit-deck"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: {
+          "gambit-deck": Array.from({ length: 100 }, (_, i) => ({
+            ticket: i.toString(16).padStart(32, "0"),
             peerId: `cap-peer-${i}`,
-            guestId: "cap-guest",
+            roomId: `CAP${i}`.padEnd(32, "0"),
             displayName: "Cap",
-          }),
-          headers: {
-            "Content-Type": "application/json",
-            "CF-Connecting-IP": `192.0.${Math.floor(i / 256)}.${i % 256}`,
-          },
-        }),
-        env,
-      )
-      expect(response.status).toBe(200)
-    }
-
-    const overflow = await worker.fetch(
-      new Request("https://test.invalid/api/matchmaking/gambit-deck/join", {
-        method: "POST",
-        body: JSON.stringify({ peerId: "cap-peer-overflow", guestId: "cap-guest" }),
-        headers: {
-          "Content-Type": "application/json",
-          "CF-Connecting-IP": "203.0.113.9",
+            guestId: `cap-guest-${i}`,
+            joinedAt: now,
+            createdAt: now,
+          })),
         },
+        matches: {},
       }),
-      env,
     )
+
+    const overflow = await join("gambit-deck", "cap-peer-overflow", "cap-guest-overflow", "Cap")
     expect(overflow.status).toBe(503)
     expect(overflow.headers.get("Retry-After")).toBeTruthy()
     expect(((await overflow.json()) as { error: string }).error).toMatch(/queue full/i)
 
-    // The cap entries are real live tickets — drain them so later tests on
-    // this game see an empty queue.
-    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
-    await runInDurableObject(stub, async (_i, s) => {
-      const stored = (await s.storage.get("queue-state")) as {
-        queues: Record<string, Array<{ guestId: string }>>
-      }
-      stored.queues["gambit-deck"] = (stored.queues["gambit-deck"] ?? []).filter(
-        (p) => p.guestId !== "cap-guest",
-      )
-      await s.storage.put("queue-state", stored)
-    })
+    // Leave the game empty for the tests after this one.
+    await resetQueue("gambit-deck")
+  })
+
+  it("refuses a fourth live entry from one address but leaves other addresses alone (A-03)", async () => {
+    // Entries from one address cannot pile up organically (a second joiner pairs
+    // with the first), so the three live entries are seeded.
+    const now = Date.now()
+    const seeded = ["a", "b", "c"].map((id, i) => ({
+      ticket: String(i + 1).repeat(32),
+      peerId: `ip-peer-${id}`,
+      roomId: id.toUpperCase().repeat(32),
+      displayName: "Ip",
+      guestId: `ip-guest-${id}`,
+      joinedAt: now,
+      createdAt: now,
+      ip: "203.0.113.7",
+    }))
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", { queues: { tictactoe: seeded }, matches: {} }),
+    )
+
+    const refused = await join("tictactoe", "ip-peer-new", "ip-guest-new", "New", "203.0.113.7")
+    expect(refused.status).toBe(429)
+    expect(refused.headers.get("Retry-After")).toBeTruthy()
+    expect(((await refused.json()) as { error: string }).error).toMatch(/active searches/i)
+
+    const stranger = await join(
+      "tictactoe",
+      "ip-peer-other",
+      "ip-guest-other",
+      "Other",
+      "203.0.113.8",
+    )
+    expect(stranger.status).toBe(200)
+    expect((await answer(stranger)).status).toBe("matched")
   })
 
   it("expires a queued ticket at its absolute age cap even while it keeps polling", async () => {
@@ -605,28 +755,490 @@ describe("MatchmakingQueues via worker fetch", () => {
     const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName("gambit-deck"))
     const staleTicket = "b".repeat(32)
     const now = Date.now()
-    await runInDurableObject(stub, async (_i, s) => {
-      const stored = (await s.storage.get("queue-state")) as {
-        queues: Record<string, unknown[]>
-        matches: Record<string, unknown>
-      }
-      const queue = stored.queues["gambit-deck"] ?? []
-      stored.queues["gambit-deck"] = queue
-      queue.push({
-        ticket: staleTicket,
-        peerId: "revive-peer",
-        roomId: "B".repeat(32),
-        displayName: "Revive",
-        guestId: "revive-guest",
-        joinedAt: now,
-        createdAt: now - 601_000,
-      })
-      await s.storage.put("queue-state", stored)
-    })
+    await runInDurableObject(stub, (_i, s) =>
+      s.storage.put("queue-state", {
+        queues: {
+          "gambit-deck": [
+            {
+              ticket: staleTicket,
+              peerId: "revive-peer",
+              roomId: "B".repeat(32),
+              displayName: "Revive",
+              guestId: "revive-guest",
+              joinedAt: now,
+              createdAt: now - 601_000,
+            },
+          ],
+        },
+        matches: {},
+      }),
+    )
 
     const response = await join("gambit-deck", "revive-peer", "revive-guest", "Revive")
     const body = (await response.json()) as { status: string; ticket: string }
     expect(body.status).toBe("waiting")
     expect(body.ticket).not.toBe(staleTicket)
+  })
+})
+
+describe("matchmaking to room binding", () => {
+  it("hands each player only their own slotToken and binds both to the room", async () => {
+    const hostWait = await answer(await join("tictactoe", "bp-host", "bg-host", "Host"))
+    const guestRes = await join("tictactoe", "bp-guest", "bg-guest", "Guest")
+    const guestText = await guestRes.clone().text()
+    const guest = await answer(guestRes)
+    expect(guest.status).toBe("matched")
+    expect(guest.slotToken).toMatch(/^[0-9a-f]{32}$/)
+
+    const hostRes = await poll("tictactoe", hostWait.ticket as string)
+    const hostText = await hostRes.clone().text()
+    const host = await answer(hostRes)
+    expect(host.status).toBe("matched")
+    expect(host.match?.role).toBe("host")
+    expect(host.slotToken).toMatch(/^[0-9a-f]{32}$/)
+    expect(host.slotToken).not.toBe(guest.slotToken)
+
+    // Neither response may carry the other player's capability, or the
+    // internal bookkeeping that holds both.
+    expect(guestText).not.toContain(host.slotToken as string)
+    expect(hostText).not.toContain(guest.slotToken as string)
+    for (const text of [guestText, hostText]) {
+      expect(text).not.toContain('"slots"')
+      expect(text).not.toContain("slotsBound")
+    }
+
+    // The room was told which token belongs to which guestId.
+    const expected = await allocation(hostWait.roomId as string)
+    expect(expected?.["bg-host"]).toMatchObject({ token: host.slotToken, role: "host" })
+    expect(expected?.["bg-guest"]).toMatchObject({ token: guest.slotToken, role: "guest" })
+  })
+
+  it("fails closed while the room is unbound: nobody is told they matched", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "fc-host", "fg-host", "Host"))
+    const guestRes = await join("tictactoe", "fc-guest", "fg-guest", "Guest")
+    const guestText = await guestRes.clone().text()
+    const guest = await answer(guestRes)
+    expect(guest.status).toBe("waiting")
+    expect(guest.ticket).toMatch(/^[0-9a-f]{32}$/)
+    expect(guestText).not.toContain("slotToken")
+    expect(guestText).not.toContain('"match"')
+
+    // The host's side of the same match is withheld too.
+    const hostPoll = await answer(await poll("tictactoe", hostWait.ticket as string))
+    expect(hostPoll.status).toBe("waiting")
+  })
+
+  it("retries the bind on poll and discloses the match once the room acknowledges it", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "rt-host", "rg-host", "Host"))
+    const guestWait = await answer(await join("tictactoe", "rt-guest", "rg-guest", "Guest"))
+    expect(guestWait.status).toBe("waiting")
+    expect(await allocation(hostWait.roomId as string)).toBeUndefined()
+
+    // The room is reachable again: the next poll pushes the allocation.
+    await restoreBind("tictactoe")
+    const guest = await answer(await poll("tictactoe", guestWait.ticket as string))
+    expect(guest.status).toBe("matched")
+    expect(guest.match?.role).toBe("guest")
+    expect(guest.match?.roomId).toBe(hostWait.roomId)
+    expect(guest.slotToken).toMatch(/^[0-9a-f]{32}$/)
+    const expected = await allocation(hostWait.roomId as string)
+    expect(expected?.["rg-guest"]?.token).toBe(guest.slotToken)
+
+    const host = await answer(await poll("tictactoe", hostWait.ticket as string))
+    expect(host.status).toBe("matched")
+    expect(host.match?.role).toBe("host")
+    expect(host.slotToken).toBe(expected?.["rg-host"]?.token)
+  })
+
+  it("answers records stored before slot tokens existed as open-mode matches", async () => {
+    const ticket = "d".repeat(32)
+    await runInDurableObject(queueStub("tictactoe"), async (instance, state) => {
+      ;(instance as unknown as { bindRoomSlots: BindFn }).bindRoomSlots = async () => {
+        throw new Error("a legacy record has nothing to bind")
+      }
+      const player = (guestId: string) => ({ peerId: `${guestId}-peer`, displayName: "L", guestId })
+      await state.storage.put("queue-state", {
+        queues: {},
+        matches: {
+          [ticket]: {
+            roomId: "L".repeat(32),
+            host: player("legacy-host"),
+            guest: player("legacy-guest"),
+            role: "host",
+            game: "tictactoe",
+            createdAt: Date.now(),
+          },
+        },
+      })
+    })
+
+    const res = await poll("tictactoe", ticket)
+    const text = await res.clone().text()
+    const body = await answer(res)
+    expect(res.status).toBe(200)
+    expect(body.status).toBe("matched")
+    expect(body.match?.role).toBe("host")
+    expect(body.match?.wsUrl).toBe(`wss://test.invalid/room/${"L".repeat(32)}`)
+    expect(text).not.toContain("slotToken")
+  })
+
+  it("does not lose a third player who queues while a match is binding (A-01)", async () => {
+    const hostWait = await answer(await join("tictactoe", "a1-host", "a1g-host", "Host"))
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const guestPending = requestInDo("tictactoe", "join", {
+      method: "POST",
+      body: JSON.stringify({ peerId: "a1-guest", guestId: "a1g-guest", displayName: "Guest" }),
+      headers: { "CF-Connecting-IP": nextIp() },
+    })
+    await bind.reached
+
+    const third = await answer(await join("tictactoe", "a1-third", "a1g-third", "Third"))
+    expect(third.status).toBe("waiting")
+
+    bind.release(true)
+    expect((await guestPending).body.status).toBe("matched")
+
+    const thirdPoll = await poll("tictactoe", third.ticket as string)
+    expect(thirdPoll.status).toBe(200)
+    expect((await answer(thirdPoll)).status).toBe("waiting")
+    expect(((await (await health("tictactoe")).json()) as { waiting: number }).waiting).toBe(1)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+  })
+
+  it("keeps a leave that lands while the match is binding (F39)", async () => {
+    const hostWait = await answer(await join("tictactoe", "f39-host", "f39g-host", "Host"))
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const guestPending = requestInDo("tictactoe", "join", {
+      method: "POST",
+      body: JSON.stringify({ peerId: "f39-guest", guestId: "f39g-guest", displayName: "Guest" }),
+      headers: { "CF-Connecting-IP": nextIp() },
+    })
+    await bind.reached
+
+    expect((await leave("tictactoe", hostWait.ticket as string)).status).toBe(200)
+    bind.release(true)
+
+    // The host cancelled: the joiner must not be told it matched a ghost.
+    const guest = (await guestPending).body
+    expect(guest.status).toBe("waiting")
+    expect(guest.match).toBeUndefined()
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(404)
+    expect((await poll("tictactoe", guest.ticket as string)).status).toBe(200)
+    expect(((await (await health("tictactoe")).json()) as { matches: number }).matches).toBe(0)
+  })
+
+  it("does not answer a poll with a match that was cancelled mid-bind (A-01)", async () => {
+    await overrideBind("tictactoe", async () => false)
+    const hostWait = await answer(await join("tictactoe", "pm-host", "pmg-host", "Host"))
+    const guestWait = await answer(await join("tictactoe", "pm-guest", "pmg-guest", "Guest"))
+    expect(guestWait.status).toBe("waiting")
+
+    const bind = parkedBind()
+    await overrideBind("tictactoe", bind.fn)
+    const pollPending = requestInDo("tictactoe", `poll?ticket=${guestWait.ticket}`)
+    await bind.reached
+    await leave("tictactoe", hostWait.ticket as string)
+    bind.release(true)
+
+    expect((await pollPending).status).toBe(404)
+  })
+})
+
+type Health = { waiting: number; matches: number; players: number }
+const healthOf = async (game: string) => (await (await health(game)).json()) as Health
+
+describe("match records and health", () => {
+  it("reports one match as one match and two players, not two matches (A-06)", async () => {
+    await join("tictactoe", "hm-host", "hmg-host", "Host")
+    await join("tictactoe", "hm-guest", "hmg-guest", "Guest")
+    expect(await healthOf("tictactoe")).toMatchObject({ waiting: 0, matches: 1, players: 2 })
+
+    await join("tictactoe", "hm-wait", "hmg-wait", "Wait")
+    expect(await healthOf("tictactoe")).toMatchObject({ waiting: 1, matches: 1, players: 3 })
+  })
+
+  it("drops a match record shortly after its ticket collected matched (A-07)", async () => {
+    const start = Date.now()
+    const hostWait = await answer(await join("tictactoe", "gc-host", "gcg-host", "Host"))
+    await join("tictactoe", "gc-guest", "gcg-guest", "Guest")
+    const nowSpy = vi.spyOn(Date, "now")
+
+    nowSpy.mockReturnValue(start + 1_000)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+    // A duplicate poll (a retried request) still gets the same answer...
+    nowSpy.mockReturnValue(start + 5_000)
+    expect((await answer(await poll("tictactoe", hostWait.ticket as string))).status).toBe(
+      "matched",
+    )
+    // ...but the tombstone is short, long before the 90 s match window ends.
+    nowSpy.mockReturnValue(start + 30_000)
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(404)
+    expect((await healthOf("tictactoe")).matches).toBe(0)
+  })
+
+  it("expires a match nobody collected after 90 seconds (A-07)", async () => {
+    const start = Date.now()
+    await join("tictactoe", "ex-host", "exg-host", "Host")
+    await join("tictactoe", "ex-guest", "exg-guest", "Guest")
+    const nowSpy = vi.spyOn(Date, "now")
+
+    nowSpy.mockReturnValue(start + 80_000)
+    expect((await healthOf("tictactoe")).matches).toBe(1)
+    nowSpy.mockReturnValue(start + 91_000)
+    expect((await healthOf("tictactoe")).matches).toBe(0)
+  })
+
+  it("caps stored match records, evicting the oldest first (A-07)", async () => {
+    const now = Date.now()
+    const record = (i: number) => ({
+      roomId: `ROOM${i}`.padEnd(32, "0"),
+      role: "host",
+      game: "tictactoe",
+      createdAt: now - 10_000 + i,
+      host: { peerId: `cp-${i}`, displayName: "C", guestId: `cg-${i}` },
+      guest: { peerId: `cq-${i}`, displayName: "C", guestId: `ch-${i}` },
+    })
+    const matches = Object.fromEntries(
+      Array.from({ length: 400 }, (_, i) => [i.toString(16).padStart(32, "0"), record(i)]),
+    )
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", { queues: {}, matches }),
+    )
+
+    const hostWait = await answer(await join("tictactoe", "cap-host", "capg-host", "Host"))
+    await join("tictactoe", "cap-guest", "capg-guest", "Guest")
+
+    expect((await healthOf("tictactoe")).matches).toBeLessThanOrEqual(400)
+    expect((await poll("tictactoe", "0".repeat(32))).status).toBe(404) // oldest evicted
+    expect((await poll("tictactoe", hostWait.ticket as string)).status).toBe(200) // newest kept
+  })
+
+  it("keeps join counters in memory, not in the persisted queue state (A-07)", async () => {
+    // A stored blob from an earlier build still carries the counters.
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: {},
+        matches: {},
+        rateLimits: { "198.51.100.1": { count: 1, windowStartedAt: Date.now() } },
+      }),
+    )
+    expect((await join("tictactoe", "rl-peer", "rlg-peer", "Rl")).status).toBe(200)
+    const stored = await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.get("queue-state"),
+    )
+    expect(stored).not.toHaveProperty("rateLimits")
+
+    // Counting still works without it: the 21st join from one address is refused.
+    let last: Response | undefined
+    for (let i = 0; i < 21; i += 1) {
+      last = await join("gambit-deck", `rl2-peer-${i}`, `rl2-guest-${i}`, "Rl", "198.51.100.99")
+    }
+    expect(last?.status).toBe(429)
+  })
+})
+
+describe("pairing freshness", () => {
+  it("skips a queued player who stopped polling and pairs with one who is polling (A-05)", async () => {
+    const start = Date.now()
+    const nowSpy = vi.spyOn(Date, "now")
+    nowSpy.mockReturnValue(start)
+    const ghost = await answer(await join("tictactoe", "fr-ghost", "frg-ghost", "Ghost"))
+
+    // The ghost closed its tab; 12 s later it is still inside the 30 s TTL but
+    // has not polled for longer than a live client ever goes silent.
+    nowSpy.mockReturnValue(start + 12_000)
+    const second = await answer(await join("tictactoe", "fr-second", "frg-second", "Second"))
+    expect(second.status).toBe("waiting")
+
+    // A third player pairs with the one who just joined, not with the ghost.
+    nowSpy.mockReturnValue(start + 13_000)
+    const third = await answer(await join("tictactoe", "fr-third", "frg-third", "Third"))
+    expect(third.status).toBe("matched")
+    expect(third.match?.role).toBe("guest")
+    expect((third.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "frg-second",
+    )
+
+    // The ghost was only skipped, not removed: if it polls again it is seen.
+    nowSpy.mockReturnValue(start + 14_000)
+    expect((await answer(await poll("tictactoe", ghost.ticket as string))).status).toBe("waiting")
+    nowSpy.mockReturnValue(start + 15_000)
+    const fourth = await answer(await join("tictactoe", "fr-fourth", "frg-fourth", "Fourth"))
+    expect(fourth.status).toBe("matched")
+    expect((fourth.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "frg-ghost",
+    )
+  })
+
+  it("keeps pairing with a player whose polls keep arriving", async () => {
+    const start = Date.now()
+    const nowSpy = vi.spyOn(Date, "now")
+    nowSpy.mockReturnValue(start)
+    const waiting = await answer(await join("tictactoe", "fp-wait", "fpg-wait", "Wait"))
+    for (const at of [4_000, 8_000, 12_000]) {
+      nowSpy.mockReturnValue(start + at)
+      expect((await answer(await poll("tictactoe", waiting.ticket as string))).status).toBe(
+        "waiting",
+      )
+    }
+    nowSpy.mockReturnValue(start + 13_000)
+    const joiner = await answer(await join("tictactoe", "fp-join", "fpg-join", "Join"))
+    expect(joiner.status).toBe("matched")
+  })
+
+  it("judges an entry with no recorded poll (after a DO restart) by its joinedAt", async () => {
+    const now = Date.now()
+    const entry = (id: string, joinedAt: number) => ({
+      ticket: id.repeat(32),
+      peerId: `rs-peer-${id}`,
+      roomId: id.toUpperCase().repeat(32),
+      displayName: "Rs",
+      guestId: `rs-guest-${id}`,
+      joinedAt,
+      createdAt: joinedAt,
+    })
+    await runInDurableObject(queueStub("tictactoe"), (_i, state) =>
+      state.storage.put("queue-state", {
+        queues: { tictactoe: [entry("a", now - 12_000), entry("b", now - 2_000)] },
+        matches: {},
+      }),
+    )
+
+    const joiner = await answer(await join("tictactoe", "rs-join", "rs-guest-join", "Join"))
+    expect(joiner.status).toBe("matched")
+    expect((joiner.match as unknown as { host: { guestId: string } }).host.guestId).toBe(
+      "rs-guest-b",
+    )
+  })
+})
+
+describe("leaving a matched ticket releases the room (A-13)", () => {
+  async function openRoomSocket(roomId: string): Promise<WebSocket> {
+    const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId))
+    const res = await room.fetch(
+      new Request("https://test.invalid/?game=tictactoe", { headers: { Upgrade: "websocket" } }),
+    )
+    const ws = res.webSocket
+    if (!ws) throw new Error(`no websocket, status ${res.status}`)
+    ws.accept()
+    return ws
+  }
+
+  function nextFrame(ws: WebSocket, label: string): Promise<{ type: string; reason?: string }> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label}: no frame within 1 s`)), 1000)
+      ws.addEventListener(
+        "message",
+        (event) => {
+          clearTimeout(timer)
+          resolve(JSON.parse(String(event.data)))
+        },
+        { once: true },
+      )
+    })
+  }
+
+  it("tells the seated opponent the room is closed and retires the allocation", async () => {
+    const host = await answer(await join("tictactoe", "rl-host", "rlg-host", "Host"))
+    const guest = await answer(await join("tictactoe", "rl-guest", "rlg-guest", "Guest"))
+    expect(guest.status).toBe("matched")
+
+    const ws = await openRoomSocket(host.roomId as string)
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        guestId: "rlg-guest",
+        displayName: "G",
+        slotToken: guest.slotToken,
+      }),
+    )
+    expect((await nextFrame(ws, "welcome")).type).toBe("welcome")
+
+    // The host cancels before ever collecting the match.
+    const released = nextFrame(ws, "peer-left")
+    expect((await leave("tictactoe", host.ticket as string)).status).toBe(200)
+    expect(await released).toMatchObject({ type: "peer-left", reason: "closed" })
+    expect(await allocation(host.roomId as string)).toBeUndefined()
+    ws.close()
+  })
+
+  it("still answers the leave when the room cannot be reached", async () => {
+    const host = await answer(await join("tictactoe", "rf-host", "rfg-host", "Host"))
+    await join("tictactoe", "rf-guest", "rfg-guest", "Guest")
+    await runInDurableObject(queueStub("tictactoe"), (instance) => {
+      ;(instance as unknown as { postToRoom: () => never }).postToRoom = () => {
+        throw new Error("room unreachable")
+      }
+    })
+    const res = await leave("tictactoe", host.ticket as string)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { status: string }).status).toBe("left")
+  })
+})
+
+describe("error boundary (A-11)", () => {
+  // An env whose Durable Object stubs throw on fetch, as when a DO is overloaded
+  // or resets mid-request.
+  const brokenNamespace = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      fetch: () => {
+        throw new Error("Durable Object reset because its code was updated")
+      },
+    }),
+  }
+  const brokenEnv = {
+    ...env,
+    MATCHMAKING_QUEUES: brokenNamespace,
+    GAME_ROOM: brokenNamespace,
+  } as unknown as typeof env
+
+  it("answers a JSON 503 with Retry-After when the queue DO throws, and logs the cause", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {})
+    const res = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/health"),
+      brokenEnv,
+    )
+    expect(res.status).toBe(503)
+    expect(res.headers.get("Retry-After")).toBeTruthy()
+    expect(res.headers.get("Content-Type")).toContain("application/json")
+    expect(await res.json()).toEqual({ error: "temporarily unavailable" })
+    expect(logged.mock.calls.flat().join(" ")).toContain("Durable Object reset")
+  })
+
+  it("answers a JSON 503 when the room DO throws on an upgrade", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const res = await worker.fetch(
+      new Request("https://test.invalid/room/ABCD1234?game=tictactoe", {
+        headers: { Upgrade: "websocket" },
+      }),
+      brokenEnv,
+    )
+    expect(res.status).toBe(503)
+    expect(res.headers.get("Retry-After")).toBeTruthy()
+    expect(await res.json()).toEqual({ error: "temporarily unavailable" })
+  })
+
+  it("never echoes an internal error message from inside the queue DO", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    await runInDurableObject(queueStub("tictactoe"), (instance) => {
+      ;(instance as unknown as { loadState: () => never }).loadState = () => {
+        throw new Error("SQLITE_FULL: secret storage detail")
+      }
+    })
+    const res = await health("tictactoe")
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(text).not.toContain("SQLITE")
+    expect(text).not.toContain("secret")
+    expect(JSON.parse(text)).toEqual({ error: "server error" })
   })
 })

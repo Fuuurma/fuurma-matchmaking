@@ -16,6 +16,18 @@ export const MAX_MESSAGE_BYTES = 64 * 1024
  */
 export const MAX_JSON_BODY_BYTES = 8 * 1024
 
+/**
+ * Compares two secrets without leaking, through timing, how long a matching
+ * prefix is. A length mismatch returns early: tokens here are fixed-size hex, so
+ * the length is not a secret.
+ */
+export function secretsMatch(a: string, b: string): boolean {
+  const encoder = new TextEncoder()
+  const left = encoder.encode(a)
+  const right = encoder.encode(b)
+  return left.byteLength === right.byteLength && crypto.subtle.timingSafeEqual(left, right)
+}
+
 /** Max length of a display name after sanitization. */
 const MAX_DISPLAY_NAME_LENGTH = 20
 

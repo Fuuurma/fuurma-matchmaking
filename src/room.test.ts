@@ -339,20 +339,15 @@ describe("GameRoomDO", () => {
     re.close()
   })
 
-  it.fails("a hello cannot claim a disclosed guestId that never connected", async () => {
-    // The join response discloses BOTH guestIds. MM-01 stopped a peer from
-    // RECLAIMING an existing slot, but a hello for a guestId that has no slot
-    // yet creates one with a fresh credential — so a peer that connects first
-    // and claims the opponent's disclosed id takes the slot and locks the
-    // real player out.
-    //
-    // `it.fails` because the secure behaviour is NOT implemented yet: this
-    // body is written to assert it, and currently fails. Whoever closes the
-    // hole must delete the `.fails` — leaving it would make a correct fix
-    // look like a regression. Closing it needs the room to know which
-    // guestIds matchmaking allocated (a per-player capability handed over at
-    // match time), which is a wire-protocol change across the Worker and both
-    // game clients, so it is an owner decision, not a patch.
+  // KNOWN LIMITATION, by design: an OPEN room (an invite link, or any room that
+  // never received matchmaking's /expect allocation) has open guestId-claim
+  // semantics, so a first hello for ANY unseen guestId gets a seat. Invite codes
+  // are the only credential there. The body below asserts the stricter behaviour
+  // and therefore fails; `it.fails` keeps it as a tripwire — if this ever starts
+  // passing, open rooms became closed and the invite flow must be re-checked.
+  // Matchmade rooms ARE closed: see "refuses a disclosed guestId without its
+  // slotToken in an allocated room" below, and the F20/F22 allocation tests.
+  it.fails("open invite rooms: a hello can still claim a disclosed guestId that never connected", async () => {
     const rid = roomId("preclaim")
     const host = await openSocket(rid)
     send(host, { type: "hello", guestId: "h", displayName: "H" })
@@ -375,6 +370,36 @@ describe("GameRoomDO", () => {
       slots.map((s) => s.guestId),
       "only the connecting player holds a slot",
     ).toEqual(["h"])
+  })
+
+  it("refuses a disclosed guestId without its slotToken in an allocated room", async () => {
+    // Same attack as the open-room tripwire above, but the room was allocated by
+    // matchmaking: the opponent's guestId alone is no longer a capability.
+    const rid = roomId("claimed")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    await stub.fetch(
+      new Request("https://test.invalid/expect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          slots: [
+            { guestId: "h", token: "tokH", role: "host" },
+            { guestId: "victim", token: "tokV", role: "guest" },
+          ],
+        }),
+      }),
+    )
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host)
+
+    const attacker = await openSocket(rid)
+    send(attacker, { type: "hello", guestId: "victim", displayName: "NotVictim" })
+    const refused = JSON.parse(await nextMessage(attacker, 1000, "claim without slotToken"))
+    expect(refused.type).toBe("error")
+    expect(refused.reconnectToken).toBeUndefined()
+    expect((await readSlots(stub)).map((s) => s.guestId)).toEqual(["h"])
+    host.close()
   })
 
   it("refuses to mint a credential for a pre-MM-01 slot's first claimant", async () => {
@@ -747,6 +772,166 @@ describe("GameRoomDO", () => {
     host.close()
   })
 
+  it("keeps the first disconnect's reap deadline when a second slot disconnects later (A-14)", async () => {
+    const rid = roomId("twoclose")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    host.close(1000, "client closing")
+    await nextMessage(guest, 1000, "host peer-left")
+
+    // The host's grace is 20 s in. When the guest drops too, the alarm must stay
+    // at the HOST's remaining 10 s, not move out to a fresh 30 s from now.
+    await runInDurableObject(stub, async (_i, s) => {
+      const stored = (await s.storage.get("room-state")) as {
+        slots: Array<{ guestId: string; disconnectedAt: number | null }>
+      }
+      for (const slot of stored.slots) {
+        if (slot.disconnectedAt !== null) slot.disconnectedAt -= 20_000
+      }
+      await s.storage.put("room-state", stored)
+    })
+    guest.close(1000, "client closing")
+    for (let i = 0; i < 40; i += 1) {
+      if ((await readSlots(stub)).every((slot) => slot.disconnectedAt !== null)) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect((await readSlots(stub)).every((slot) => slot.disconnectedAt !== null)).toBe(true)
+
+    const alarm = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())
+    expect(alarm).not.toBeNull()
+    expect((alarm ?? 0) - Date.now()).toBeLessThan(11_000)
+  })
+
+  // Item 12 (tic-tac-toe client report). A hello that NAMES a role must not be
+  // silently seated as the other one: creating invite room "friday-game" with
+  // role:"host" while someone else already holds that seat used to seat the
+  // second caller as guest, announce peer-joined to the real host, and end the
+  // room when the "guest" then left. Hellos that name no role stay first-come.
+  describe("a requested role that another guestId already holds", () => {
+    async function seat(rid: string, guestId: string, role?: "host" | "guest") {
+      const ws = await openSocket(rid)
+      send(ws, { type: "hello", guestId, displayName: guestId, ...(role ? { role } : {}) })
+      return { ws, welcome: JSON.parse(await nextMessage(ws, 1000, `${guestId} welcome`)) }
+    }
+
+    for (const [taken, label] of [
+      ["host", "host seat"],
+      ["guest", "guest seat"],
+    ] as const) {
+      it(`refuses a second claim on the ${label} before welcome and tells the holder nothing`, async () => {
+        const rid = roomId(`taken${taken}`)
+        const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+        const holder = await seat(rid, "holder", taken)
+        expect(holder.welcome).toMatchObject({ type: "welcome", role: taken })
+
+        const intruder = await openSocket(rid)
+        const refused = nextMessage(intruder, 1000, "role-taken error")
+        send(intruder, { type: "hello", guestId: "intruder", displayName: "I", role: taken })
+        expect(JSON.parse(await refused)).toEqual({
+          type: "error",
+          code: "role-taken",
+          message: "That room code is already in use",
+        })
+        await expectNoMessage(holder.ws, "the seated player must not hear about the refused claim")
+        expect((await readSlots(stub)).map((slot) => slot.guestId)).toEqual(["holder"])
+        holder.ws.close()
+        intruder.close()
+      })
+    }
+
+    it("still seats a hello that names the OTHER, free role", async () => {
+      const rid = roomId("freerole")
+      const host = await seat(rid, "h", "host")
+      const guest = await seat(rid, "g", "guest")
+      expect(guest.welcome).toMatchObject({ type: "welcome", role: "guest" })
+      expect(JSON.parse(await nextMessage(host.ws, 1000, "peer-joined")).type).toBe("peer-joined")
+      host.ws.close()
+      guest.ws.close()
+    })
+
+    it("keeps first-come seating when the hello names no role", async () => {
+      const rid = roomId("norole")
+      const first = await seat(rid, "a")
+      const second = await seat(rid, "b")
+      expect(first.welcome.role).toBe("host")
+      expect(second.welcome.role).toBe("guest")
+      first.ws.close()
+      second.ws.close()
+    })
+
+    it("lets the holder reconnect with its token while naming its own role", async () => {
+      const rid = roomId("rolerecon")
+      const host = await seat(rid, "h", "host")
+      const guest = await seat(rid, "g", "guest")
+      await nextMessage(host.ws, 1000, "peer-joined")
+
+      host.ws.close(4000, "reconnecting")
+      await nextMessage(guest.ws, 1000, "peer-left")
+      const back = await openSocket(rid)
+      send(back, {
+        type: "hello",
+        guestId: "h",
+        displayName: "h",
+        role: "host",
+        reconnectToken: host.welcome.reconnectToken,
+      })
+      expect(JSON.parse(await nextMessage(back, 1000, "reconnect welcome"))).toMatchObject({
+        type: "welcome",
+        role: "host",
+      })
+      back.close()
+      guest.ws.close()
+    })
+
+    it("does not apply to an allocated room: the slotToken decides the role", async () => {
+      const rid = roomId("allocrole")
+      const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+      await pushExpect(stub, [
+        { guestId: "h1", token: "tokH", role: "host" },
+        { guestId: "g1", token: "tokG", role: "guest" },
+      ])
+      const host = await openSocket(rid)
+      send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+      await nextMessage(host)
+      const guest = await openSocket(rid)
+      // The allocated guest names "host" by mistake; the allocation wins.
+      send(guest, {
+        type: "hello",
+        guestId: "g1",
+        displayName: "G",
+        slotToken: "tokG",
+        role: "host",
+      })
+      expect(JSON.parse(await nextMessage(guest, 1000, "allocated welcome"))).toMatchObject({
+        type: "welcome",
+        role: "guest",
+      })
+      host.close()
+      guest.close()
+    })
+  })
+
+  it("does not relay frames to a socket that has not said hello (A-15)", async () => {
+    const rid = roomId("pendfan")
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+
+    // Connected, no hello yet: not a player, so not an audience.
+    const lurker = await openSocket(rid)
+    send(host, { type: "move", cell: 4 })
+    await expectNoMessage(lurker, "frame relayed to an unauthenticated socket")
+    host.close()
+    lurker.close()
+  })
+
   it("rejects reserved server message types from clients (anti-spoofing)", async () => {
     const rid = roomId("spoof")
     const host = await openSocket(rid)
@@ -966,6 +1151,51 @@ describe("GameRoomDO", () => {
       }),
     )
   }
+
+  it("cancel releases a seated peer, spares the leaver, and leaves no state behind (A-13)", async () => {
+    const rid = roomId("cancel")
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rid))
+    const cancel = (body: unknown) =>
+      stub.fetch(
+        new Request("https://test.invalid/cancel", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      )
+
+    expect((await cancel({})).status).toBe(400)
+    expect((await cancel({ guestId: "g1" })).status).toBe(200)
+    expect(await runInDurableObject(stub, (_i, s) => s.storage.get("room-state"))).toBeUndefined()
+
+    expect(
+      (
+        await pushExpect(stub, [
+          { guestId: "h1", token: "tokH", role: "host" },
+          { guestId: "g1", token: "tokG", role: "guest" },
+        ])
+      ).status,
+    ).toBe(200)
+    const host = await openSocket(rid)
+    send(host, { type: "hello", guestId: "h1", displayName: "H", slotToken: "tokH" })
+    await nextMessage(host)
+    const guest = await openSocket(rid)
+    send(guest, { type: "hello", guestId: "g1", displayName: "G", slotToken: "tokG" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+
+    // g1 cancels: h1 is told the room is closed, g1 is not told about itself.
+    const closed = nextMessage(host)
+    expect((await cancel({ guestId: "g1" })).status).toBe(200)
+    expect(JSON.parse(await closed)).toEqual({ type: "peer-left", reason: "closed" })
+    await expectNoMessage(guest, "the leaver must not be told it left")
+    const stored = (await runInDurableObject(stub, (_i, s) => s.storage.get("room-state"))) as {
+      expected?: unknown
+    }
+    expect(stored.expected).toBeUndefined()
+    host.close()
+    guest.close()
+  })
 
   it("evicts an open-claim squatter when the allocation lands (F20)", async () => {
     const rid = roomId("squatnew")
