@@ -2,7 +2,9 @@
 
 Shared Cloudflare Worker + two Durable Objects for matchmaking and per-room
 WebSocket relay across all Fuurma games. Replaces PeerJS P2P for turn-based
-play (see [`migrations/2026-07-games-do-websocket-migration.md`](https://github.com/Fuuurma/hub/blob/main/migrations/2026-07-games-do-websocket-migration.md)).
+play. Design rationale lives in `src/room.ts` (header) and `src/index.ts`;
+the original migration plan was removed from the hub 2026-09-10 and survives
+in SF git history (`migrations/2026-07-games-do-websocket-migration.md`).
 
 ## Architecture
 
