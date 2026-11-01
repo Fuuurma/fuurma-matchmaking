@@ -5,8 +5,15 @@
 /** Games served by this Worker. Used by both the router and the room DO. */
 export const ALLOWED_GAMES = new Set(["tictactoe", "gambit-deck"])
 
-/** Max WebSocket message size (64 KiB — generous for turn-based game moves). */
-export const MAX_MESSAGE_BYTES = 64 * 1024
+/**
+ * Max WebSocket message size — 512 KiB, matching the gambit-deck client's
+ * own MAX_MESSAGE_SIZE_BYTES (src/lib/room.ts). The two caps must agree:
+ * a state_snapshot between the client's accept limit and this relay's
+ * refusal left the host having reset its sequence epoch while the guest
+ * never applied the snapshot (gambit-deck F1297 — a ~226-move game
+ * clears the old 64 KiB at ~257 B per move-history record).
+ */
+export const MAX_MESSAGE_BYTES = 512 * 1024
 
 /**
  * Max JSON request body for join/leave (8 KiB — legitimate payloads are

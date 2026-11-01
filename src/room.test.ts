@@ -1042,8 +1042,8 @@ describe("GameRoomDO", () => {
     const ws = await openSocket(roomId("bigmsg"))
     send(ws, { type: "hello", guestId: "big", displayName: "B" })
     await nextMessage(ws)
-    // Send a message exceeding the 64 KiB cap.
-    const oversized = { type: "move", payload: "x".repeat(70_000) }
+    // Send a message exceeding the 512 KiB cap.
+    const oversized = { type: "move", payload: "x".repeat(600_000) }
     ws.send(JSON.stringify(oversized))
     const raw = JSON.parse(await nextMessage(ws))
     expect(raw.type).toBe("error")
@@ -1057,13 +1057,35 @@ describe("GameRoomDO", () => {
     send(ws, { type: "hello", guestId: "big", displayName: "B" })
     await nextMessage(ws)
     // 25k × U+20AC: .length ~25k (under the old check) but 75k UTF-8 bytes.
-    const oversized = { type: "move", payload: "€".repeat(25_000) }
+    const oversized = { type: "move", payload: "€".repeat(200_000) }
     ws.send(JSON.stringify(oversized))
     const raw = JSON.parse(await nextMessage(ws))
     expect(raw.type).toBe("error")
     expect(raw.code).toBe("invalid")
     expect(raw.message).toMatch(/too large/i)
     ws.close()
+  })
+
+  it("relays a frame between the old 64 KiB cap and MAX_MESSAGE_BYTES (F1297)", async () => {
+    // A gambit-deck state_snapshot for a ~226-move game is ~64-80 KiB:
+    // the stale 64 KiB relay cap refused delivery AFTER the host had
+    // already reset its sequence epoch, so the match never converged.
+    const host = await openSocket(roomId("f1297snap"))
+    send(host, { type: "hello", guestId: "h", displayName: "H" })
+    await nextMessage(host)
+    const guest = await openSocket(roomId("f1297snap"))
+    send(guest, { type: "hello", guestId: "g", displayName: "G" })
+    await nextMessage(guest)
+    await nextMessage(host) // peer-joined
+    const frame = JSON.stringify({ type: "state_snapshot", state: { pad: "y".repeat(70_000) } })
+    const bytes = new TextEncoder().encode(frame).length
+    expect(bytes).toBeGreaterThan(64 * 1024)
+    expect(bytes).toBeLessThanOrEqual(512 * 1024)
+    host.send(frame)
+    const relayed = JSON.parse(await nextMessage(guest))
+    expect(relayed.type).toBe("state_snapshot")
+    host.close()
+    guest.close()
   })
 
   it("accepts a multibyte frame of exactly MAX_MESSAGE_BYTES (MM-04)", async () => {
@@ -1074,9 +1096,9 @@ describe("GameRoomDO", () => {
     send(guest, { type: "hello", guestId: "g", displayName: "G" })
     await nextMessage(guest)
     await nextMessage(host) // peer-joined
-    // JSON overhead is 28 ASCII bytes; "é" is 2 bytes: 28 + 2*32754 = 65536.
-    const frame = JSON.stringify({ type: "move", payload: "é".repeat(32_754) })
-    expect(new TextEncoder().encode(frame).length).toBe(64 * 1024)
+    // JSON overhead is 28 ASCII bytes; "é" is 2 bytes: 28 + 2*262130 = 524288.
+    const frame = JSON.stringify({ type: "move", payload: "é".repeat(262_130) })
+    expect(new TextEncoder().encode(frame).length).toBe(512 * 1024)
     host.send(frame)
     const relayed = JSON.parse(await nextMessage(guest))
     expect(relayed.type).toBe("move")
