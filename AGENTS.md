@@ -16,7 +16,7 @@ Use the deeper hub docs when relevant:
 - Auth/OAuth: `~/Projects/hub/tech-stack/AUTH-OAUTH.md`
 - Forms: `~/Projects/hub/tech-stack/TANSTACK-FORM.md`
 - Deploy/launch: `~/Projects/hub/tech-stack/SHIP-KIT.md`
-- Ports: `~/Projects/hub/tech-stack/PORTS.md`
+- Ports: `~/Projects/hub/control/PORTS.md`
 - Secrets/accounts: `~/Projects/hub/tech-stack/ACCOUNTS-SECRETS.md`
 
 Operational rules:
