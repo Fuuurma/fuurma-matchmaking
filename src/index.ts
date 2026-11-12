@@ -13,6 +13,7 @@ import {
   MAX_TICKET_LENGTH,
   sanitizeDisplayName,
   utf8ByteLength,
+  withSecurityHeaders,
 } from "./utils"
 
 export { GameRoomDO }
@@ -671,84 +672,94 @@ export class MatchmakingQueues extends DurableObject {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url)
-
-    if (url.pathname === "/") {
-      return jsonResponse({ ok: true, service: "fuurma-matchmaking" })
-    }
-
-    // WebSocket relay route: /room/{roomId}
-    if (request.method === "GET" && url.pathname.startsWith("/room/")) {
-      const roomId = url.pathname.slice("/room/".length)
-      if (!isValidRoomId(roomId)) {
-        return jsonResponse({ error: "invalid room id" }, 400)
-      }
-      try {
-        return await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId)).fetch(request)
-      } catch (err) {
-        return unavailable("room", err)
-      }
-    }
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() })
-    }
-
-    const match = url.pathname.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
-    if (!match) {
-      return jsonResponse({ error: "not found" }, 404)
-    }
-
-    const game = match[1]
-    if (!ALLOWED_GAMES.has(game)) {
-      return jsonResponse({ error: "unknown game" }, 400)
-    }
-
-    const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
-    let response: Response
     try {
-      response = await stub.fetch(request)
+      return withSecurityHeaders(await routeRequest(request, env))
     } catch (err) {
-      return unavailable("queue", err)
+      const message = err instanceof Error ? err.message : String(err)
+      logEvent("error", "worker_request_failed", { message })
+      return jsonResponse({ error: "server error" }, 500)
     }
-
-    // Inject wsUrl into matched responses so the client can connect directly.
-    const contentType = response.headers.get("Content-Type") ?? ""
-    if (response.ok && contentType.includes("application/json")) {
-      try {
-        const cloned = response.clone()
-        const body = (await cloned.json()) as Record<string, unknown> | null
-        if (
-          body &&
-          typeof body === "object" &&
-          "match" in body &&
-          body.match &&
-          typeof body.match === "object"
-        ) {
-          const match = body.match as Record<string, unknown>
-          if (typeof match.roomId === "string" && typeof match.wsUrl !== "string") {
-            match.wsUrl = buildWsUrl(request.url, match.roomId)
-            // Build fresh headers — the original Content-Length is now stale
-            // because we added the wsUrl field, and reusing it would truncate
-            // the response body.
-            const headers = new Headers()
-            headers.set("Content-Type", "application/json")
-            for (const [key, value] of Object.entries(corsHeaders())) {
-              headers.set(key, value)
-            }
-            return new Response(JSON.stringify(body), {
-              status: response.status,
-              headers,
-            })
-          }
-        }
-      } catch {
-        // not JSON; return original
-      }
-    }
-
-    return response
   },
+}
+
+async function routeRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url)
+
+  if (url.pathname === "/") {
+    return jsonResponse({ ok: true, service: "fuurma-matchmaking" })
+  }
+
+  // WebSocket relay route: /room/{roomId}
+  if (request.method === "GET" && url.pathname.startsWith("/room/")) {
+    const roomId = url.pathname.slice("/room/".length)
+    if (!isValidRoomId(roomId)) {
+      return jsonResponse({ error: "invalid room id" }, 400)
+    }
+    try {
+      return await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomId)).fetch(request)
+    } catch (err) {
+      return unavailable("room", err)
+    }
+  }
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders() })
+  }
+
+  const match = url.pathname.match(/^\/api\/matchmaking\/([^/]+)(?:\/(.+))?$/)
+  if (!match) {
+    return jsonResponse({ error: "not found" }, 404)
+  }
+
+  const game = match[1]
+  if (!ALLOWED_GAMES.has(game)) {
+    return jsonResponse({ error: "unknown game" }, 400)
+  }
+
+  const stub = env.MATCHMAKING_QUEUES.get(env.MATCHMAKING_QUEUES.idFromName(game))
+  let response: Response
+  try {
+    response = await stub.fetch(request)
+  } catch (err) {
+    return unavailable("queue", err)
+  }
+
+  // Inject wsUrl into matched responses so the client can connect directly.
+  const contentType = response.headers.get("Content-Type") ?? ""
+  if (response.ok && contentType.includes("application/json")) {
+    try {
+      const cloned = response.clone()
+      const body = (await cloned.json()) as Record<string, unknown> | null
+      if (
+        body &&
+        typeof body === "object" &&
+        "match" in body &&
+        body.match &&
+        typeof body.match === "object"
+      ) {
+        const match = body.match as Record<string, unknown>
+        if (typeof match.roomId === "string" && typeof match.wsUrl !== "string") {
+          match.wsUrl = buildWsUrl(request.url, match.roomId)
+          // Build fresh headers — the original Content-Length is now stale
+          // because we added the wsUrl field, and reusing it would truncate
+          // the response body.
+          const headers = new Headers()
+          headers.set("Content-Type", "application/json")
+          for (const [key, value] of Object.entries(corsHeaders())) {
+            headers.set(key, value)
+          }
+          return new Response(JSON.stringify(body), {
+            status: response.status,
+            headers,
+          })
+        }
+      }
+    } catch {
+      // not JSON; return original
+    }
+  }
+
+  return response
 }
 
 function clientIp(request: Request): string {

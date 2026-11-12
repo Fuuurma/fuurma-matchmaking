@@ -6,6 +6,7 @@ import {
   logEvent,
   MAX_GUEST_ID_LENGTH,
   MAX_MESSAGE_BYTES,
+  SECURITY_HEADERS,
   sanitizeDisplayName,
   secretsMatch,
   utf8ByteLength,
@@ -268,7 +269,14 @@ export class GameRoomDO extends DurableObject {
     this.ctx.acceptWebSocket(server)
     server.serializeAttachment({ pending: true, connectedAt: Date.now() })
     await this.schedulePendingHandshakeAlarm()
-    return new Response(null, { status: 101, webSocket: client })
+    // The edge cannot stamp headers on this response later — a WebSocket
+    // upgrade cannot be rebuilt without losing the socket — so the security
+    // set goes on at construction like every other response here.
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: SECURITY_HEADERS,
+    })
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

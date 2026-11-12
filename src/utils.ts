@@ -92,20 +92,58 @@ export function sanitizeDisplayName(value: string | undefined | null): string {
 }
 
 /**
- * CORS + baseline security headers applied to all JSON responses.
- * CSP is the API shape (`default-src 'none'` — the Worker serves JSON and
- * WebSocket, never a document) plus `frame-ancestors 'none'`; `nosniff`
- * stops content-type sniffing of the JSON bodies.
+ * Baseline security headers stamped on every Worker response — the standard
+ * set a header probe grades. CSP is the API shape (`default-src 'none'` —
+ * the Worker serves JSON and WebSocket, never a document) plus
+ * `frame-ancestors 'none'`; `X-Frame-Options` backs the CSP for agents that
+ * ignore it; `nosniff` stops content-type sniffing of the JSON bodies;
+ * `no-referrer` keeps request URLs out of downstream logs; HSTS and
+ * Permissions-Policy round out the set.
+ */
+export const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+/**
+ * CORS headers plus the security set, applied to all JSON responses.
  */
 export function corsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-    "X-Content-Type-Options": "nosniff",
-    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+    ...SECURITY_HEADERS,
   }
+}
+
+/**
+ * Stamp the security set onto a response at the Worker edge. Durable Object
+ * passthrough responses carry immutable headers, so a response missing any
+ * of the set is rebuilt rather than mutated — WebSocket upgrades cannot be
+ * reconstructed without losing the socket, so the room DO sets the same
+ * headers at construction instead (see GameRoomDO.fetch).
+ */
+export function withSecurityHeaders(response: Response): Response {
+  if (response.status === 101 || response.webSocket) return response
+  const headers = new Headers(response.headers)
+  let missing = false
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    if (!headers.has(name)) {
+      headers.set(name, value)
+      missing = true
+    }
+  }
+  if (!missing) return response
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
 }
 
 /** Build a JSON Response with CORS headers. */

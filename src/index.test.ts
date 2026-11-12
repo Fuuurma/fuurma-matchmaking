@@ -1242,3 +1242,61 @@ describe("error boundary (A-11)", () => {
     expect(JSON.parse(text)).toEqual({ error: "server error" })
   })
 })
+
+describe("security headers", () => {
+  // The standard set a header probe grades (live-site probe 2026-11-12 found
+  // x-frame-options missing). Pinned on the wire shape, not on corsHeaders().
+  const EXPECTED: Record<string, string> = {
+    "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  }
+
+  function expectSecurityHeaders(res: Response): void {
+    for (const [name, value] of Object.entries(EXPECTED)) {
+      expect(res.headers.get(name), name).toBe(value)
+    }
+  }
+
+  it("stamps the set on every response shape", async () => {
+    // Worker-local health.
+    expectSecurityHeaders(await worker.fetch(new Request("https://test.invalid/"), env))
+    // Durable Object passthrough — its headers are immutable on the wire.
+    expectSecurityHeaders(await health("tictactoe"))
+    // Unknown path and the preflight 204.
+    expectSecurityHeaders(await worker.fetch(new Request("https://test.invalid/nope"), env))
+    const preflight = await worker.fetch(
+      new Request("https://test.invalid/api/matchmaking/tictactoe/join", { method: "OPTIONS" }),
+      env,
+    )
+    expect(preflight.status).toBe(204)
+    expectSecurityHeaders(preflight)
+    // Room route errors.
+    expectSecurityHeaders(await worker.fetch(new Request("https://test.invalid/room/x"), env))
+
+    // A matched join exercises the wsUrl rewrite, which rebuilds headers.
+    const host = await join("tictactoe", "sec-host", "secg-host", "Host")
+    expectSecurityHeaders(host)
+    const hostBody = (await host.json()) as { status: string; ticket: string }
+    const guest = await join("tictactoe", "sec-guest", "secg-guest", "Guest")
+    expectSecurityHeaders(guest)
+    expect(((await guest.json()) as { status: string }).status).toBe("matched")
+    await leave("tictactoe", hostBody.ticket)
+  })
+
+  it("stamps the set on the room WebSocket upgrade", async () => {
+    const res = await worker.fetch(
+      new Request("https://test.invalid/room/SECHEADERS01?game=tictactoe", {
+        headers: { Upgrade: "websocket" },
+      }),
+      env,
+    )
+    expect(res.status).toBe(101)
+    expectSecurityHeaders(res)
+    res.webSocket?.accept()
+    res.webSocket?.close()
+  })
+})
