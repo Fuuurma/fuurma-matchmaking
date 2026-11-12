@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 
 import { env, runInDurableObject } from "cloudflare:test"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"

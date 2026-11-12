@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 
 /**
  * Contract tests: the SDK's injectable `socket`/`fetch` pointed at the real
